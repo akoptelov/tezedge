@@ -20,6 +20,7 @@ num-traits = "0.2.8"
 # local dependencies
 crypto = { path = "../../crypto" }
 tezos_encoding = { path = "../encoding" }
+tokio = { version = "1.2.0", features = ["io-util"]}
 
 [[bench]]
 name = "message_benchmark"

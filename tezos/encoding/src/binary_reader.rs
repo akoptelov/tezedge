@@ -4,12 +4,21 @@
 //! Tezos binary data reader.
 
 use failure::ResultExt;
-use std::fmt::{self, Display};
+use std::{
+    cmp::min,
+    convert::{TryFrom, TryInto},
+    fmt::{self, Display},
+    io::Cursor,
+    num::TryFromIntError,
+};
 
 use bit_vec::BitVec;
-use bytes::Buf;
 use failure::Fail;
 use serde::de::Error as SerdeError;
+use tokio::io::{AsyncRead, AsyncReadExt, Take};
+
+use std::future::Future;
+use std::pin::Pin;
 
 use crate::bit_utils::{BitReverse, BitTrim, Bits, ToBytes};
 use crate::de;
@@ -23,14 +32,14 @@ pub type BinaryReaderError = EncodingError<BinaryReaderErrorKind>;
 
 /// Actual size of encoded data
 #[derive(Debug, Clone, Copy)]
-pub enum ActualSize {
+pub enum ActualSize<T> {
     /// Exact size
-    Exact(usize),
+    Exact(T),
     /// Unknown size exceeding the limit
-    GreaterThan(usize),
+    GreaterThan(T),
 }
 
-impl Display for ActualSize {
+impl<T: Display> Display for ActualSize<T> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
             ActualSize::Exact(size) => write!(f, "{}", size),
@@ -42,6 +51,9 @@ impl Display for ActualSize {
 /// Kind of error for [BinaryReaderError]
 #[derive(Debug, Fail, Clone)]
 pub enum BinaryReaderErrorKind {
+    /// IO Error
+    #[fail(display = "I/O error: {}", _0)]
+    IOError(String, std::io::ErrorKind),
     /// More bytes were expected than there were available in input buffer.
     #[fail(display = "Input underflow, missing {} bytes", bytes)]
     Underflow { bytes: usize },
@@ -55,6 +67,9 @@ pub enum BinaryReaderErrorKind {
     /// may simply mean that we have not yet defined tag in encoding.
     #[fail(display = "No tag found for id: 0x{:X}", tag)]
     UnsupportedTag { tag: u16 },
+    ///
+    #[fail(display = "Unexpected encoding: {}", _0)]
+    UnexpectedEncoding(String),
     /// Encoding boundary constraint violation
     #[fail(
         display = "Encoded data {} exceeded its size boundary: {}, actual: {}",
@@ -63,11 +78,20 @@ pub enum BinaryReaderErrorKind {
     EncodingBoundaryExceeded {
         name: String,
         boundary: usize,
-        actual: ActualSize,
+        actual: ActualSize<usize>,
     },
     /// Arithmetic overflow
     #[fail(display = "Arithmetic overflow while encoding {:?}", encoding)]
     ArithmeticOverflow { encoding: &'static str },
+    /// Int conversion error
+    #[fail(display = "Error while converting integer value: {:?}", _0)]
+    FromIntError(TryFromIntError),
+}
+
+impl From<std::io::Error> for BinaryReaderError {
+    fn from(error: std::io::Error) -> Self {
+        BinaryReaderErrorKind::IOError(error.to_string(), error.kind()).into()
+    }
 }
 
 impl From<crate::de::Error> for BinaryReaderError {
@@ -94,28 +118,29 @@ impl From<crate::bit_utils::BitsError> for BinaryReaderError {
     }
 }
 
-/// Safely read from input buffer. If input buffer does not contain enough bytes to construct desired error is returned.
-#[macro_export]
-macro_rules! safe {
-    ($buf:ident, $foo:ident, $sz:ident) => {{
-        use std::mem::size_of;
-        if $buf.remaining() >= size_of::<$sz>() {
-            $buf.$foo()
-        } else {
-            return Result::Err(BinaryReaderErrorKind::Underflow {
-                bytes: (size_of::<$sz>() - $buf.remaining()),
-            })?;
-        }
-    }};
-    ($buf:ident, $sz:expr, $exp:expr) => {{
-        if $buf.remaining() >= $sz {
-            $exp
-        } else {
-            return Result::Err(BinaryReaderErrorKind::Underflow {
-                bytes: ($sz - $buf.remaining()),
-            })?;
-        }
-    }};
+impl From<TryFromIntError> for BinaryReaderError {
+    fn from(error: TryFromIntError) -> Self {
+        BinaryReaderErrorKind::FromIntError(error).into()
+    }
+}
+
+pub type Result<'a> =
+    Pin<Box<dyn Future<Output = std::result::Result<Value, BinaryReaderError>> + 'a>>;
+
+pub trait BinaryRead: AsyncRead {
+    fn remaining(&self) -> std::result::Result<usize, BinaryReaderError>;
+}
+
+impl<R: AsyncRead> BinaryRead for Take<R> {
+    fn remaining(&self) -> std::result::Result<usize, BinaryReaderError> {
+        Ok(self.limit().try_into()?)
+    }
+}
+
+impl<T: AsRef<[u8]> + Unpin> BinaryRead for Cursor<T> {
+    fn remaining(&self) -> std::result::Result<usize, BinaryReaderError> {
+        Ok(self.get_ref().as_ref().len() - usize::try_from(self.position())?)
+    }
 }
 
 /// Converts Tezos binary form into rust types.
@@ -164,263 +189,387 @@ impl BinaryReader {
         &self,
         buf: Buf,
         encoding: &Encoding,
-    ) -> Result<Value, BinaryReaderError> {
-        let mut buf = buf.as_ref();
-
-        let result = match encoding {
-            Encoding::Obj(schema) => self.decode_record(&mut buf, schema),
-            Encoding::Tup(encodings) => self.decode_tuple(&mut buf, encodings),
-            _ => self.decode_value(&mut buf, encoding),
-        }?;
-
-        if buf.remaining() == 0 {
-            Ok(result)
-        } else {
-            Err(BinaryReaderErrorKind::Overflow {
-                bytes: buf.remaining(),
-            })?
-        }
-    }
-
-    fn decode_record(
-        &self,
-        buf: &mut dyn Buf,
-        schema: &[Field],
-    ) -> Result<Value, BinaryReaderError> {
-        let mut values = Vec::with_capacity(schema.len());
-        for field in schema {
-            let name = field.get_name();
-            let encoding = field.get_encoding();
-            values.push((
-                name.clone(),
-                self.decode_value(buf, encoding)
-                    .with_context(|e| e.field(field.get_name()))?,
-            ))
-        }
-        Ok(Value::Record(values))
-    }
-
-    fn decode_tuple(
-        &self,
-        buf: &mut dyn Buf,
-        encodings: &[Encoding],
-    ) -> Result<Value, BinaryReaderError> {
-        let mut values = Vec::with_capacity(encodings.len());
-        for encoding in encodings {
-            values.push(self.decode_value(buf, encoding)?)
-        }
-        Ok(Value::Tuple(values))
-    }
-
-    fn decode_value(
-        &self,
-        buf: &mut dyn Buf,
-        encoding: &Encoding,
-    ) -> Result<Value, BinaryReaderError> {
-        match encoding {
-            Encoding::Unit => Ok(Value::Unit),
-            Encoding::Int8 => Ok(Value::Int8(safe!(buf, get_i8, i8))),
-            Encoding::Uint8 => Ok(Value::Uint8(safe!(buf, get_u8, u8))),
-            Encoding::Int16 => Ok(Value::Int16(safe!(buf, get_i16, i16))),
-            Encoding::Uint16 => Ok(Value::Uint16(safe!(buf, get_u16, u16))),
-            Encoding::Int31 => Ok(Value::Int31(safe!(buf, get_i32, i32))),
-            Encoding::Int32 => Ok(Value::Int32(safe!(buf, get_i32, i32))),
-            Encoding::Int64 | Encoding::Timestamp => Ok(Value::Int64(safe!(buf, get_i64, i64))),
-            Encoding::Float => Ok(Value::Float(safe!(buf, get_f64, f64))),
-            Encoding::Bool => {
-                let b = safe!(buf, get_u8, u8);
-                match b {
-                    types::BYTE_VAL_TRUE => Ok(Value::Bool(true)),
-                    types::BYTE_VAL_FALSE => Ok(Value::Bool(false)),
-                    _ => Err(de::Error::custom(format!(
-                        "Vas expecting 0xFF or 0x00 but instead got {:X}",
-                        b
-                    )))?,
+    ) -> std::result::Result<Value, BinaryReaderError> {
+        let rt = tokio::runtime::Builder::new_current_thread().build()?;
+        let buf = buf.as_ref();
+        let mut read = Cursor::new(buf).take(buf.len().try_into()?);
+        match rt.block_on(self.read_async(&mut read, encoding)) {
+            Ok(value) => {
+                if read.remaining()? == 0 {
+                    Ok(value)
+                } else {
+                    Err(BinaryReaderErrorKind::Overflow {
+                        bytes: read.remaining()?,
+                    })?
                 }
             }
-            Encoding::String => {
-                let bytes_sz = safe!(buf, get_u32, u32) as usize;
-                let mut str_buf = vec![0u8; bytes_sz].into_boxed_slice();
-                safe!(buf, bytes_sz, buf.copy_to_slice(&mut str_buf));
-                let str_buf = str_buf.into_vec();
-                Ok(Value::String(String::from_utf8(str_buf)?))
-            }
-            Encoding::BoundedString(bytes_max) => {
-                let bytes_sz = safe!(buf, get_u32, u32) as usize;
-                if bytes_sz > *bytes_max {
-                    Err(BinaryReaderErrorKind::EncodingBoundaryExceeded {
-                        name: "Encoding::BoundedString".to_string(),
-                        boundary: *bytes_max,
-                        actual: ActualSize::Exact(bytes_sz),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Convert Tezos binary stream asyncronously into [intermadiate form](Value). Input binary is parsed according to [`encoding`](Encoding).
+    ///
+    /// Since the [AsyncRead] can provide data of arbitrary length, `encoding` should be wrapped into either [Encoding::Dynamic] or [Encodin::DynamicBounded].
+    ///
+    /// # Examples:
+    /// TODO
+    pub async fn read_message_async<'a>(
+        &'a self,
+        buf: &'a mut (dyn AsyncRead + Unpin),
+        encoding: &'a Encoding,
+    ) -> std::result::Result<Value, BinaryReaderError> {
+        let value = match encoding {
+            Encoding::Dynamic(encoding) => {
+                let size = buf.read_u32().await?;
+                let take: &mut (dyn BinaryRead + Unpin) = &mut buf.take(size.into());
+                let value = self.read_async(take, encoding).await?;
+                if take.remaining()? != 0 {
+                    Err(BinaryReaderErrorKind::Overflow {
+                        bytes: take.remaining()?,
                     })?
                 } else {
-                    let mut str_buf = vec![0u8; bytes_sz].into_boxed_slice();
-                    safe!(buf, bytes_sz, buf.copy_to_slice(&mut str_buf));
-                    let str_buf = str_buf.into_vec();
-                    Ok(Value::String(String::from_utf8(str_buf)?))
+                    value
                 }
             }
-            Encoding::Enum => Ok(Value::Enum(None, Some(u32::from(safe!(buf, get_u8, u8))))),
-            Encoding::Dynamic(dynamic_encoding) => {
-                let bytes_sz = safe!(buf, get_u32, u32) as usize;
-                let mut buf_slice = safe!(buf, bytes_sz, buf.take(bytes_sz));
-                self.decode_value(&mut buf_slice, dynamic_encoding)
-            }
-            Encoding::BoundedDynamic(max, dynamic_encoding) => {
-                let bytes_sz = safe!(buf, get_u32, u32) as usize;
-                if bytes_sz > *max {
+            Encoding::BoundedDynamic(max, encoding) => {
+                let size = buf.read_u32().await?;
+                if usize::try_from(size)? > *max {
                     Err(BinaryReaderErrorKind::EncodingBoundaryExceeded {
                         name: "Encoding::BoundedDynamic".to_string(),
                         boundary: *max,
-                        actual: ActualSize::Exact(bytes_sz),
+                        actual: ActualSize::Exact(size.try_into()?),
                     })?
                 } else {
-                    let mut buf_slice = safe!(buf, bytes_sz, buf.take(bytes_sz));
-                    self.decode_value(&mut buf_slice, dynamic_encoding)
+                    let take: &mut (dyn BinaryRead + Unpin) = &mut buf.take(size.into());
+                    let value = self.read_async(take, encoding).await?;
+                    if take.remaining()? != 0 {
+                        Err(BinaryReaderErrorKind::Overflow {
+                            bytes: take.remaining()?,
+                        })?
+                    } else {
+                        value
+                    }
                 }
             }
-            Encoding::Sized(sized_size, sized_encoding) => {
-                let mut buf_slice = safe!(buf, *sized_size, buf.take(*sized_size));
-                self.decode_value(&mut buf_slice, sized_encoding)
+            _ => Err(BinaryReaderErrorKind::UnexpectedEncoding(format!(
+                "read_message_async expects Dynamic or BoundedDynamic encoding, got {:?}",
+                encoding
+            )))?,
+        };
+        Ok(value)
+    }
+
+    pub fn read_async<'a>(
+        &'a self,
+        buf: &'a mut (dyn BinaryRead + Unpin),
+        encoding: &'a Encoding,
+    ) -> Result<'a> {
+        Box::pin(async move {
+            let result = match encoding {
+                Encoding::Obj(schema) => self.decode_record(buf, schema).await?,
+                Encoding::Tup(encodings) => self.decode_tuple(buf, encodings).await?,
+                _ => self.decode_value(buf, encoding).await?,
+            };
+
+            Ok(result)
+        })
+    }
+
+    fn decode_record<'a>(
+        &'a self,
+        buf: &'a mut (dyn BinaryRead + Unpin),
+        schema: &'a [Field],
+    ) -> Result<'a> {
+        Box::pin(async move {
+            let mut values = Vec::with_capacity(schema.len());
+            for field in schema {
+                let name = field.get_name();
+                let encoding = field.get_encoding();
+                values.push((
+                    name.clone(),
+                    self.decode_value(buf, encoding)
+                        .await
+                        .with_context(|e| e.field(field.get_name()))?,
+                ))
             }
-            Encoding::Bounded(max, inner_encoding) => {
-                let upper = std::cmp::min(*max, buf.remaining());
-                let mut buf_slice = safe!(buf, upper, buf.take(upper));
-                let res = self.decode_value(&mut buf_slice, inner_encoding);
-                match res {
-                    // if underlying encoding requires more data than we have,
-                    // and it is limited to maximal possible size, that means
-                    // that this is bounded constraint violation.
-                    Err(e) => match e.kind() {
-                        BinaryReaderErrorKind::Underflow { bytes } if upper == *max => {
-                            let act_size = bytes.checked_add(*max).ok_or_else(|| {
-                                BinaryReaderErrorKind::ArithmeticOverflow {
-                                    encoding: "Encoding::Bounded",
-                                }
-                            })?;
-                            Err(BinaryReaderErrorKind::EncodingBoundaryExceeded {
-                                name: "Encoding::Bounded".to_string(),
-                                boundary: *max,
-                                actual: ActualSize::Exact(act_size),
+            Ok(Value::Record(values))
+        })
+    }
+
+    fn decode_tuple<'a>(
+        &'a self,
+        buf: &'a mut (dyn BinaryRead + Unpin),
+        encodings: &'a [Encoding],
+    ) -> Result<'a> {
+        Box::pin(async move {
+            let mut values = Vec::with_capacity(encodings.len());
+            for encoding in encodings {
+                values.push(self.decode_value(buf, encoding).await?)
+            }
+            Ok(Value::Tuple(values))
+        })
+    }
+
+    fn decode_value<'a>(
+        &'a self,
+        buf: &'a mut (dyn BinaryRead + Unpin + 'a),
+        encoding: &'a Encoding,
+    ) -> Result<'a> {
+        Box::pin(async move {
+            match encoding {
+                Encoding::Unit => Ok(Value::Unit),
+                Encoding::Int8 => Ok(Value::Int8(buf.read_i8().await?)),
+                Encoding::Uint8 => Ok(Value::Uint8(buf.read_u8().await?)),
+                Encoding::Int16 => Ok(Value::Int16(buf.read_i16().await?)),
+                Encoding::Uint16 => Ok(Value::Uint16(buf.read_u16().await?)),
+                Encoding::Int31 => Ok(Value::Int31(buf.read_i32().await?)),
+                Encoding::Int32 => Ok(Value::Int32(buf.read_i32().await?)),
+                Encoding::Int64 | Encoding::Timestamp => Ok(Value::Int64(buf.read_i64().await?)),
+                Encoding::Float => {
+                    let mut float = [0u8; 8];
+                    buf.read_exact(&mut float).await?;
+                    Ok(Value::Float(f64::from_be_bytes(float)))
+                }
+                Encoding::Bool => {
+                    let b = buf.read_u8().await?;
+                    match b {
+                        types::BYTE_VAL_TRUE => Ok(Value::Bool(true)),
+                        types::BYTE_VAL_FALSE => Ok(Value::Bool(false)),
+                        _ => Err(de::Error::custom(format!(
+                            "Vas expecting 0xFF or 0x00 but instead got {:X}",
+                            b
+                        )))?,
+                    }
+                }
+                Encoding::String => {
+                    let bytes_sz = buf.read_u32().await?;
+                    let mut str_buf = vec![0u8; bytes_sz.try_into()?];
+                    buf.read_exact(&mut str_buf).await?;
+                    Ok(Value::String(String::from_utf8(str_buf)?))
+                }
+                Encoding::BoundedString(bytes_max) => {
+                    let bytes_sz = buf.read_u32().await?;
+                    if usize::try_from(bytes_sz)? > *bytes_max {
+                        Err(BinaryReaderErrorKind::EncodingBoundaryExceeded {
+                            name: "Encoding::BoundedString".to_string(),
+                            boundary: *bytes_max,
+                            actual: ActualSize::Exact(bytes_sz.try_into()?),
+                        })?
+                    } else {
+                        let mut str_buf = vec![0u8; bytes_sz.try_into()?];
+                        buf.read_exact(&mut str_buf).await?;
+                        Ok(Value::String(String::from_utf8(str_buf)?))
+                    }
+                }
+                Encoding::Enum => Ok(Value::Enum(None, Some(u32::from(buf.read_u8().await?)))),
+                Encoding::Dynamic(dynamic_encoding) => {
+                    let bytes_sz = buf.read_u32().await?;
+                    if usize::try_from(bytes_sz)? > buf.remaining()? {
+                        Err(BinaryReaderErrorKind::Underflow {
+                            bytes: usize::try_from(bytes_sz)? - buf.remaining()?,
+                        })?
+                    } else {
+                        let mut take = buf.take(bytes_sz.into());
+                        let value = self.decode_value(&mut take, dynamic_encoding).await?;
+                        if take.limit() == 0 {
+                            Ok(value)
+                        } else {
+                            Err(BinaryReaderErrorKind::Overflow {
+                                bytes: take.remaining()?,
                             })?
                         }
-                        _ => Err(e),
-                    },
-                    r => r,
-                }
-            }
-            Encoding::Greedy(un_sized_encoding) => {
-                let bytes_sz = buf.remaining();
-                let mut buf_slice = safe!(buf, bytes_sz, buf.take(bytes_sz));
-                self.decode_value(&mut buf_slice, un_sized_encoding)
-            }
-            Encoding::Tags(tag_sz, ref tag_map) => {
-                let tag_id = match tag_sz {
-                    /*u8*/ 1 => Ok(u16::from(safe!(buf, get_u8, u8))),
-                    /*u16*/ 2 => Ok(safe!(buf, get_u16, u16)),
-                    _ => Err(de::Error::custom(format!(
-                        "Unsupported tag size {}",
-                        tag_sz
-                    ))),
-                }?;
-
-                match tag_map.find_by_id(tag_id) {
-                    Some(tag) => {
-                        let tag_value = self.decode_value(buf, tag.get_encoding())?;
-                        Ok(Value::Tag(
-                            tag.get_variant().to_string(),
-                            Box::new(tag_value),
-                        ))
                     }
-                    None => Err(BinaryReaderErrorKind::UnsupportedTag { tag: tag_id })?,
                 }
-            }
-            Encoding::List(encoding_inner) => {
-                let bytes_sz = buf.remaining();
-
-                let mut buf_slice = buf.take(bytes_sz);
-
-                let mut values = vec![];
-                while buf_slice.remaining() > 0 {
-                    values.push(
-                        self.decode_value(&mut buf_slice, encoding_inner)
-                            .with_context(|e| e.element_of())?,
-                    );
-                }
-
-                Ok(Value::List(values))
-            }
-            Encoding::BoundedList(max, encoding_inner) => {
-                let bytes_sz = buf.remaining();
-
-                let mut buf_slice = buf.take(bytes_sz);
-
-                let mut values = vec![];
-                while buf_slice.remaining() > 0 {
-                    if values.len() >= *max {
-                        return Err(BinaryReaderErrorKind::EncodingBoundaryExceeded {
-                            name: "Encoding::List".to_string(),
+                Encoding::BoundedDynamic(max, dynamic_encoding) => {
+                    let bytes_sz = buf.read_u32().await?;
+                    if usize::try_from(bytes_sz)? > *max {
+                        Err(BinaryReaderErrorKind::EncodingBoundaryExceeded {
+                            name: "Encoding::BoundedDynamic".to_string(),
                             boundary: *max,
-                            actual: ActualSize::GreaterThan(values.len()),
-                        })?;
+                            actual: ActualSize::Exact(bytes_sz.try_into()?),
+                        })?
+                    } else if usize::try_from(bytes_sz)? > buf.remaining()? {
+                        Err(BinaryReaderErrorKind::Underflow {
+                            bytes: usize::try_from(bytes_sz)? - buf.remaining()?,
+                        })?
+                    } else {
+                        let mut take = buf.take(bytes_sz.into());
+                        let value = self.decode_value(&mut take, dynamic_encoding).await?;
+                        if take.limit() == 0 {
+                            Ok(value)
+                        } else {
+                            Err(BinaryReaderErrorKind::Overflow {
+                                bytes: take.remaining()?,
+                            })?
+                        }
                     }
-                    values.push(
-                        self.decode_value(&mut buf_slice, encoding_inner)
-                            .with_context(|e| e.element_of())?,
-                    );
                 }
+                Encoding::Sized(sized_size, sized_encoding) => {
+                    let mut take =
+                        buf.take(min((*sized_size).try_into()?, buf.remaining()?.try_into()?));
+                    let value = self.decode_value(&mut take, sized_encoding).await?;
+                    if take.limit() == 0 {
+                        Ok(value)
+                    } else {
+                        Err(BinaryReaderErrorKind::Underflow {
+                            bytes: take.limit().try_into()?,
+                        })?
+                    }
+                }
+                Encoding::Bounded(max, inner_encoding) => self
+                    .decode_value(
+                        &mut buf.take(min((*max).try_into()?, buf.remaining()?.try_into()?)),
+                        inner_encoding,
+                    )
+                    .await
+                    .map_err(|e| match e.kind() {
+                        BinaryReaderErrorKind::IOError(_, std::io::ErrorKind::UnexpectedEof) => {
+                            BinaryReaderErrorKind::EncodingBoundaryExceeded {
+                                name: "Encoding::Bounded".to_string(),
+                                boundary: *max,
+                                actual: ActualSize::GreaterThan(*max),
+                            }
+                            .into()
+                        }
+                        _ => e,
+                    }),
+                Encoding::Greedy(un_sized_encoding) => {
+                    self.decode_value(buf, un_sized_encoding).await
+                }
+                Encoding::Tags(tag_sz, ref tag_map) => {
+                    let tag_id = match tag_sz {
+                        /*u8*/ 1 => Ok(u16::from(buf.read_u8().await?)),
+                        /*u16*/ 2 => Ok(buf.read_u16().await?),
+                        _ => Err(de::Error::custom(format!(
+                            "Unsupported tag size {}",
+                            tag_sz
+                        ))),
+                    }?;
 
-                Ok(Value::List(values))
-            }
-            Encoding::Option(inner_encoding) => {
-                let is_present_byte = safe!(buf, get_u8, u8);
-                match is_present_byte {
-                    types::BYTE_VAL_SOME => {
-                        let v = self.decode_value(buf, inner_encoding)?;
-                        Ok(Value::Option(Some(Box::new(v))))
+                    match tag_map.find_by_id(tag_id) {
+                        Some(tag) => {
+                            let tag_value = self.decode_value(buf, tag.get_encoding()).await?;
+                            Ok(Value::Tag(
+                                tag.get_variant().to_string(),
+                                Box::new(tag_value),
+                            ))
+                        }
+                        None => Err(BinaryReaderErrorKind::UnsupportedTag { tag: tag_id })?,
                     }
-                    types::BYTE_VAL_NONE => Ok(Value::Option(None)),
-                    _ => Err(de::Error::custom(format!(
-                        "Unexpected option value {:X}",
-                        is_present_byte
-                    )))?,
                 }
-            }
-            Encoding::OptionalField(inner_encoding) => {
-                let is_present_byte = safe!(buf, get_u8, u8);
-                match is_present_byte {
-                    types::BYTE_FIELD_SOME => {
-                        let v = self.decode_value(buf, inner_encoding)?;
-                        Ok(Value::Option(Some(Box::new(v))))
+                Encoding::List(encoding_inner) => {
+                    let mut values = vec![];
+                    while buf.remaining()? != 0 {
+                        values.push(
+                            self.decode_value(buf, encoding_inner)
+                                .await
+                                .with_context(|e| e.element_of())?,
+                        );
                     }
-                    types::BYTE_FIELD_NONE => Ok(Value::Option(None)),
-                    _ => Err(de::Error::custom(format!(
-                        "Unexpected option value {:X}",
-                        is_present_byte
-                    )))?,
+                    Ok(Value::List(values))
                 }
-            }
-            Encoding::Obj(schema_inner) => Ok(self.decode_record(buf, schema_inner)?),
-            Encoding::Tup(encodings_inner) => Ok(self.decode_tuple(buf, encodings_inner)?),
-            Encoding::Z => {
-                // read first byte
-                let byte = safe!(buf, get_u8, u8);
-                let negative = byte.get(6)?;
-                if byte <= 0x3F {
-                    let mut num = i32::from(byte);
-                    if negative {
-                        num *= -1;
+                Encoding::BoundedList(max, encoding_inner) => {
+                    let mut values = vec![];
+                    while buf.remaining()? != 0 {
+                        if values.len() >= *max {
+                            return Err(BinaryReaderErrorKind::EncodingBoundaryExceeded {
+                                name: "Encoding::List".to_string(),
+                                boundary: *max,
+                                actual: ActualSize::GreaterThan(*max),
+                            })?;
+                        }
+                        values.push(
+                            self.decode_value(buf, encoding_inner)
+                                .await
+                                .with_context(|e| e.element_of())?,
+                        );
                     }
-                    Ok(Value::String(format!("{:x}", num)))
-                } else {
+                    Ok(Value::List(values))
+                }
+                Encoding::Option(inner_encoding) => {
+                    let is_present_byte = buf.read_u8().await?;
+                    match is_present_byte {
+                        types::BYTE_VAL_SOME => {
+                            let v = self.decode_value(buf, inner_encoding).await?;
+                            Ok(Value::Option(Some(Box::new(v))))
+                        }
+                        types::BYTE_VAL_NONE => Ok(Value::Option(None)),
+                        _ => Err(de::Error::custom(format!(
+                            "Unexpected option value {:X}",
+                            is_present_byte
+                        )))?,
+                    }
+                }
+                Encoding::OptionalField(inner_encoding) => {
+                    let is_present_byte = buf.read_u8().await?;
+                    match is_present_byte {
+                        types::BYTE_FIELD_SOME => {
+                            let v = self.decode_value(buf, inner_encoding).await?;
+                            Ok(Value::Option(Some(Box::new(v))))
+                        }
+                        types::BYTE_FIELD_NONE => Ok(Value::Option(None)),
+                        _ => Err(de::Error::custom(format!(
+                            "Unexpected option value {:X}",
+                            is_present_byte
+                        )))?,
+                    }
+                }
+                Encoding::Obj(schema_inner) => Ok(self.decode_record(buf, schema_inner).await?),
+                Encoding::Tup(encodings_inner) => {
+                    Ok(self.decode_tuple(buf, encodings_inner).await?)
+                }
+                Encoding::Z => {
+                    // read first byte
+                    let byte = buf.read_u8().await?;
+                    let negative = byte.get(6)?;
+                    if byte <= 0x3F {
+                        let mut num = i32::from(byte);
+                        if negative {
+                            num *= -1;
+                        }
+                        Ok(Value::String(format!("{:x}", num)))
+                    } else {
+                        let mut bits = BitVec::new();
+                        for bit_idx in 0..6 {
+                            bits.push(byte.get(bit_idx)?);
+                        }
+
+                        let mut has_next_byte = true;
+                        while has_next_byte {
+                            let byte = buf.read_u8().await?;
+                            for bit_idx in 0..7 {
+                                bits.push(byte.get(bit_idx)?)
+                            }
+
+                            has_next_byte = byte.get(7)?;
+                        }
+
+                        let bytes = bits.reverse().trim_left().to_byte_vec();
+
+                        let mut str_num = bytes
+                            .iter()
+                            .enumerate()
+                            .map(|(idx, b)| match idx {
+                                0 => format!("{:x}", *b),
+                                _ => format!("{:02x}", *b),
+                            })
+                            .fold(String::new(), |mut str_num, val| {
+                                str_num.push_str(&val);
+                                str_num
+                            });
+                        if negative {
+                            str_num = String::from("-") + &str_num;
+                        }
+
+                        Ok(Value::String(str_num))
+                    }
+                }
+                Encoding::Mutez => {
                     let mut bits = BitVec::new();
-                    for bit_idx in 0..6 {
-                        bits.push(byte.get(bit_idx)?);
-                    }
 
                     let mut has_next_byte = true;
                     while has_next_byte {
-                        let byte = safe!(buf, get_u8, u8);
+                        let byte = buf.read_u8().await?;
                         for bit_idx in 0..7 {
                             bits.push(byte.get(bit_idx)?)
                         }
@@ -430,7 +579,7 @@ impl BinaryReader {
 
                     let bytes = bits.reverse().trim_left().to_byte_vec();
 
-                    let mut str_num = bytes
+                    let str_num = bytes
                         .iter()
                         .enumerate()
                         .map(|(idx, b)| match idx {
@@ -441,85 +590,46 @@ impl BinaryReader {
                             str_num.push_str(&val);
                             str_num
                         });
-                    if negative {
-                        str_num = String::from("-") + &str_num;
-                    }
 
                     Ok(Value::String(str_num))
                 }
-            }
-            Encoding::Mutez => {
-                let mut bits = BitVec::new();
-
-                let mut has_next_byte = true;
-                while has_next_byte {
-                    let byte = safe!(buf, get_u8, u8);
-                    for bit_idx in 0..7 {
-                        bits.push(byte.get(bit_idx)?)
-                    }
-
-                    has_next_byte = byte.get(7)?;
+                Encoding::Bytes => {
+                    let mut buf_slice = Vec::new();
+                    buf.read_to_end(&mut buf_slice).await?;
+                    Ok(Value::List(
+                        buf_slice.iter().map(|&byte| Value::Uint8(byte)).collect(),
+                    ))
                 }
-
-                let bytes = bits.reverse().trim_left().to_byte_vec();
-
-                let str_num = bytes
-                    .iter()
-                    .enumerate()
-                    .map(|(idx, b)| match idx {
-                        0 => format!("{:x}", *b),
-                        _ => format!("{:02x}", *b),
-                    })
-                    .fold(String::new(), |mut str_num, val| {
-                        str_num.push_str(&val);
-                        str_num
-                    });
-
-                Ok(Value::String(str_num))
+                Encoding::Hash(hash_type) => {
+                    let bytes_sz = hash_type.size();
+                    let mut buf_slice = vec![0u8; bytes_sz];
+                    buf.read_exact(&mut buf_slice).await?;
+                    Ok(Value::List(
+                        buf_slice.iter().map(|&byte| Value::Uint8(byte)).collect(),
+                    ))
+                }
+                Encoding::Split(inner_encoding) => {
+                    let inner_encoding = inner_encoding(SchemaType::Binary);
+                    self.decode_value(buf, &inner_encoding).await
+                }
+                Encoding::Lazy(fn_encoding) => {
+                    let inner_encoding = fn_encoding();
+                    self.decode_value(buf, &inner_encoding).await
+                }
+                Encoding::Custom(codec) => codec.decode(buf, encoding).await,
+                Encoding::Uint32 | Encoding::RangedInt | Encoding::RangedFloat => Err(
+                    de::Error::custom(format!("Unsupported encoding {:?}", encoding)),
+                )?,
             }
-            Encoding::Bytes => {
-                let bytes_sz = buf.remaining();
-                let mut buf_slice = vec![0u8; bytes_sz].into_boxed_slice();
-                buf.copy_to_slice(&mut buf_slice);
-                Ok(Value::List(
-                    buf_slice
-                        .into_vec()
-                        .iter()
-                        .map(|&byte| Value::Uint8(byte))
-                        .collect(),
-                ))
-            }
-            Encoding::Hash(hash_type) => {
-                let bytes_sz = hash_type.size();
-                let mut buf_slice = vec![0u8; bytes_sz].into_boxed_slice();
-                safe!(buf, bytes_sz, buf.copy_to_slice(&mut buf_slice));
-                Ok(Value::List(
-                    buf_slice
-                        .into_vec()
-                        .iter()
-                        .map(|&byte| Value::Uint8(byte))
-                        .collect(),
-                ))
-            }
-            Encoding::Split(inner_encoding) => {
-                let inner_encoding = inner_encoding(SchemaType::Binary);
-                self.decode_value(buf, &inner_encoding)
-            }
-            Encoding::Lazy(fn_encoding) => {
-                let inner_encoding = fn_encoding();
-                self.decode_value(buf, &inner_encoding)
-            }
-            Encoding::Custom(codec) => codec.decode(buf, encoding),
-            Encoding::Uint32 | Encoding::RangedInt | Encoding::RangedFloat => Err(
-                de::Error::custom(format!("Unsupported encoding {:?}", encoding)),
-            )?,
-        }
+        })
     }
 }
 
 #[cfg(test)]
 mod tests {
     use std::mem::size_of;
+
+    use std::io::Cursor;
 
     use serde::{Deserialize, Serialize};
 
@@ -530,18 +640,19 @@ mod tests {
 
     use super::*;
 
-    #[test]
-    fn can_deserialize_mutez_from_binary() {
+    #[async_std::test]
+    async fn can_deserialize_mutez_from_binary() {
         #[derive(Deserialize, Debug)]
         struct Record {
             a: BigInt,
         }
         let record_schema = vec![Field::new("a", Encoding::Mutez)];
 
-        let record_buf = hex::decode("9e9ed49d01").unwrap();
+        let mut record_buf = Cursor::new(hex::decode("9e9ed49d01").unwrap());
         let reader = BinaryReader::new();
         let value = reader
-            .read(record_buf, &Encoding::Obj(record_schema))
+            .read_async(&mut record_buf, &Encoding::Obj(record_schema))
+            .await
             .unwrap();
         assert_eq!(
             Value::Record(vec![(

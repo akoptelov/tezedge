@@ -3,16 +3,15 @@
 
 //! Schema used for serialization and deserialization.
 
-use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
+use std::{collections::HashMap, future::Future, pin::Pin};
 
 use crypto::hash::HashType;
 
-use crate::binary_reader::BinaryReaderError;
+use crate::binary_reader::{BinaryRead, BinaryReaderError};
 use crate::ser::Error;
 use crate::types::Value;
-use bytes::Buf;
 
 #[derive(Debug, Clone)]
 pub struct Field {
@@ -154,7 +153,11 @@ pub trait CustomCodec {
         encoding: &Encoding,
     ) -> Result<(), Error>;
 
-    fn decode(&self, buf: &mut dyn Buf, encoding: &Encoding) -> Result<Value, BinaryReaderError>;
+    fn decode<'a>(
+        &self,
+        buf: &'a mut (dyn BinaryRead + Unpin),
+        encoding: &Encoding,
+    ) -> Pin<Box<dyn Future<Output = Result<Value, BinaryReaderError>> + 'a>>;
 }
 
 impl fmt::Debug for dyn CustomCodec + Send + Sync {

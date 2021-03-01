@@ -47,13 +47,14 @@ fn can_deserialize_swap_max() -> Result<(), Error> {
 fn can_t_deserialize_swap_point_max_plus() -> Result<(), Error> {
     let encoded = hex::decode(data::SWAP_MESSAGE_POINT_OVER_MAX)?;
     let err = SwapMessage::from_bytes(encoded).expect_err("Error is expected");
+    println!("{:?}", err);
     assert!(matches!(
         err.kind(),
         BinaryReaderErrorKind::EncodingBoundaryExceeded {
             name: _,
             boundary: P2P_POINT_MAX_SIZE,
-            actual: ActualSize::Exact(actual),
-        } if actual == P2P_POINT_MAX_SIZE + 1
+            actual: ActualSize::GreaterThan(P2P_POINT_MAX_SIZE),
+        }
     ));
     Ok(())
 }
