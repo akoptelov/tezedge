@@ -389,7 +389,7 @@ pub async fn bootstrap(
     info: Arc<LocalPeerInfo>,
     log: &Logger,
 ) -> Result<BootstrapOutput, PeerError> {
-    let (mut msg_rx, mut msg_tx) = {
+    let (msg_rx, mut msg_tx) = {
         let stream = msg
             .stream
             .lock()
@@ -423,8 +423,10 @@ pub async fn bootstrap(
         }
     };
 
+    let mut msg_rx = EncryptedMessageReader::new(msg_rx, log.clone());
+
     // receive connection message
-    let received_connection_message_bytes = match timeout(IO_TIMEOUT, msg_rx.read_message()).await?
+    let received_connection_message_bytes = match timeout(IO_TIMEOUT, msg_rx.read_connection_message()).await?
     {
         Ok(msg) => msg,
         Err(e) => {
@@ -462,8 +464,7 @@ pub async fn bootstrap(
     // from now on all messages will be encrypted
     let mut msg_tx =
         EncryptedMessageWriter::new(msg_tx, precomputed_key.clone(), nonce_local, log.clone());
-    let mut msg_rx =
-        EncryptedMessageReader::new(msg_rx, precomputed_key, nonce_remote, log.clone());
+    msg_rx.set_crypt_data(precomputed_key, nonce_remote);
 
     let connecting_to_self = peer_public_key == info.identity.public_key;
     if connecting_to_self {

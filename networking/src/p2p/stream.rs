@@ -5,23 +5,19 @@
 //!
 //! It provides message packaging from/to binary format, encryption, message nonce handling.
 
-use std::convert::TryInto;
-use std::io;
+use std::{convert::TryInto, io, pin::Pin, task::Poll};
 
 use bytes::Buf;
 use failure::_core::time::Duration;
 use failure::{Error, Fail};
 use slog::{trace, FnValue, Logger};
-use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadBuf, ReadHalf, WriteHalf};
 use tokio::net::TcpStream;
 
 use crypto::crypto_box::PrecomputedKey;
 use crypto::nonce::Nonce;
 use crypto::CryptoError;
-use tezos_encoding::{
-    binary_reader::{BinaryReaderError, BinaryReaderErrorKind},
-    binary_writer::BinaryWriterError,
-};
+use tezos_encoding::{binary_reader::BinaryReaderError, binary_writer::BinaryWriterError};
 use tezos_messages::p2p::binary_message::{
     BinaryChunk, BinaryChunkError, BinaryMessage, CONTENT_LENGTH_FIELD_BYTES,
 };
@@ -88,7 +84,7 @@ impl slog::Value for StreamError {
 
 /// Holds read and write parts of the message stream.
 pub struct MessageStream {
-    reader: MessageReader,
+    reader: ReadHalf<TcpStream>,
     writer: MessageWriter,
 }
 
@@ -99,13 +95,13 @@ impl MessageStream {
 
         let (rx, tx) = tokio::io::split(stream);
         MessageStream {
-            reader: MessageReader { stream: rx },
+            reader: rx,
             writer: MessageWriter { stream: tx },
         }
     }
 
     #[inline]
-    pub fn split(self) -> (MessageReader, MessageWriter) {
+    pub fn split(self) -> (ReadHalf<TcpStream>, MessageWriter) {
         (self.reader, self.writer)
     }
 }
@@ -128,7 +124,7 @@ impl MessageReader {
     pub async fn read_message(&mut self) -> Result<BinaryChunk, StreamError> {
         // read encoding length (2 bytes)
         let msg_len_bytes = self.read_message_length_bytes().await?;
-        // copy bytes containing encoding length to raw encoding buffer
+        // copy bytes containing encoding length to`` raw encoding buffer
         let mut all_recv_bytes = vec![];
         all_recv_bytes.extend(&msg_len_bytes);
 
@@ -233,29 +229,41 @@ impl EncryptedMessageWriter {
 pub struct EncryptedMessageReader {
     /// Precomputed key is created from merge of peer public key and our secret key.
     /// It's used to speedup of crypto operations.
-    precomputed_key: PrecomputedKey,
     /// Nonce used to decrypt received messages
-    nonce_remote: Nonce,
+    crypt_data: Option<CryptData>,
     /// Incoming message reader
-    rx: MessageReader,
+    read: ReadHalf<TcpStream>,
+    /// Chunk size buffer
+    size_buffer: [u8; 2],
+    /// Chunk data buffer
+    data_buffer: Vec<u8>,
+    /// Async read state
+    state: ReadState,
     /// Logger
     log: Logger,
 }
 
 impl EncryptedMessageReader {
     /// Create new encrypted message from async reader and peer data
-    pub fn new(
-        rx: MessageReader,
-        precomputed_key: PrecomputedKey,
-        nonce_remote: Nonce,
-        log: Logger,
-    ) -> Self {
+    pub fn new(read: ReadHalf<TcpStream>, log: Logger) -> Self {
         EncryptedMessageReader {
-            rx,
-            precomputed_key,
-            nonce_remote,
+            read,
+            crypt_data: None,
+            size_buffer: [0; 2],
+            data_buffer: vec![0; u32::MAX as usize],
+            state: ReadState::ReadSize { offset: 0 },
             log,
         }
+    }
+
+    pub async fn read_connection_message(&mut self) -> Result<BinaryChunk, StreamError> {
+        let mut buf = vec![];
+        self.read_to_end(&mut buf).await?;
+        Ok(buf.try_into()?)
+    }
+
+    pub fn set_crypt_data(&mut self, precomputed_key: PrecomputedKey, nonce_remote: Nonce) {
+        self.crypt_data = Some(CryptData { precomputed_key, nonce_remote });
     }
 
     /// Consume content of inner message reader into specific message
@@ -263,55 +271,129 @@ impl EncryptedMessageReader {
     where
         M: BinaryMessage,
     {
-        let mut input_remaining = 0;
-        let mut input_data = vec![];
-
-        loop {
-            // read
-            let message_encrypted = self.rx.read_message().await?;
-
-            // decrypt
-            let nonce = self.nonce_fetch_increment();
-            match self
-                .precomputed_key
-                .decrypt(message_encrypted.content(), &nonce)
-            {
-                Ok(mut message_decrypted) => {
-                    trace!(self.log, "Message received"; "message" => FnValue(|_| hex::encode(&message_decrypted)));
-                    if input_remaining >= message_decrypted.len() {
-                        input_remaining -= message_decrypted.len();
-                    } else {
-                        input_remaining = 0;
-                    }
-
-                    input_data.append(&mut message_decrypted);
-
-                    if input_remaining == 0 {
-                        match M::from_bytes(&input_data) {
-                            Ok(message) => break Ok(message),
-                            Err(e) => match e.kind() {
-                                BinaryReaderErrorKind::Underflow { bytes } => {
-                                    input_remaining += bytes
-                                }
-                                _ => break Err(e.into()),
-                            },
-                        }
-                    }
-                }
-                Err(error) => {
-                    break Err(StreamError::FailedToDecryptMessage { error });
-                }
-            }
-        }
-    }
-
-    #[inline]
-    fn nonce_fetch_increment(&mut self) -> Nonce {
-        let incremented = self.nonce_remote.increment();
-        std::mem::replace(&mut self.nonce_remote, incremented)
+        let message = M::async_read(self).await.unwrap();
+        Ok(message)
     }
 
     pub fn unsplit(self, tx: EncryptedMessageWriter) -> TcpStream {
-        self.rx.stream.unsplit(tx.tx.stream)
+        self.read.unsplit(tx.tx.stream)
+    }
+}
+
+enum ReadState {
+    ReadSize { offset: usize },
+    ReadData { size: usize, offset: usize },
+    DataAvail { size: usize, offset: usize },
+}
+
+struct CryptData {
+    precomputed_key: PrecomputedKey, nonce_remote: Nonce
+}
+
+impl CryptData {
+    fn fetch_increment_nonce(&mut self) -> Nonce {
+        let nonce = self.nonce_remote.increment();
+        std::mem::replace(&mut self.nonce_remote, nonce)
+    }
+}
+
+use tokio::io::AsyncRead;
+
+impl AsyncRead for EncryptedMessageReader {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        let me = &mut *self;
+        loop {
+            match me.state {
+                ReadState::ReadSize { offset } => {
+                    let mut buff = ReadBuf::new(&mut me.size_buffer[offset..]);
+                    let rem = buff.remaining();
+                    match Pin::new(&mut me.read).poll_read(cx, &mut buff) {
+                        Poll::Ready(_) => (),
+                        Poll::Pending => return Poll::Pending,
+                    }
+                    if rem == buff.remaining() {
+                        return Err(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            "eof reading chunk size",
+                        ))
+                        .into();
+                    }
+                    me.state = if buff.remaining() == 0 {
+                        ReadState::ReadData {
+                            size: u16::from_be_bytes(me.size_buffer) as usize,
+                            offset: 0,
+                        }
+                    } else {
+                        ReadState::ReadSize {
+                            offset: offset + buff.remaining() - rem,
+                        }
+                    };
+                }
+                ReadState::ReadData { size, offset } => {
+                    let mut buff = ReadBuf::new(&mut me.data_buffer.as_mut_slice()[offset..size]);
+                    let rem = buff.remaining();
+                    match Pin::new(&mut me.read).poll_read(cx, &mut buff) {
+                        Poll::Ready(_) => (),
+                        Poll::Pending => return Poll::Pending,
+                    }
+                    if rem == buff.remaining() {
+                        return Err(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            "eof reading chunk data",
+                        ))
+                        .into();
+                    }
+                    me.state = if buff.remaining() == 0 {
+                        if let Some(ref mut crypt_data) = me.crypt_data {
+                            let nonce = crypt_data.fetch_increment_nonce();
+                            match crypt_data.precomputed_key
+                                .decrypt(me.data_buffer.as_slice(), &nonce)
+                            {
+                                Ok(message_decrypted) => {
+                                    trace!(me.log, "Message received"; "message" => FnValue(|_| hex::encode(&message_decrypted)));
+                                    me.data_buffer.copy_from_slice(&message_decrypted);
+                                    ReadState::DataAvail { size, offset: 0 }
+                                }
+                                Err(error) => {
+                                    return Err(io::Error::new(
+                                        io::ErrorKind::InvalidData,
+                                        format!("error decryping a chunk: {}", error),
+                                    ))
+                                    .into();
+                                }
+                            }
+                        } else {
+                            ReadState::DataAvail { size, offset: 0 }
+                        }
+                    } else {
+                        ReadState::ReadData {
+                            size,
+                            offset: offset + buff.remaining() - rem,
+                        }
+                    };
+                }
+                ReadState::DataAvail { size, offset } => {
+                    let amt = std::cmp::min(size - offset, buf.remaining());
+                    let (a, _) = me.data_buffer.as_slice().split_at(amt);
+                    buf.put_slice(a);
+                    me.state = if amt < size - offset {
+                        ReadState::DataAvail {
+                            size,
+                            offset: offset + amt,
+                        }
+                    } else if me.crypt_data.is_some() {
+                        // we should continue to the next chunk
+                        ReadState::ReadSize { offset: 0 }
+                    } else {
+                        ReadState::DataAvail { size, offset: size }
+                    };
+                    return Poll::Ready(Ok(()));
+                }
+            }
+        }
     }
 }

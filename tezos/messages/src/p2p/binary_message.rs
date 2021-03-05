@@ -1,6 +1,8 @@
 // Copyright (c) SimpleStaking and Tezedge Contributors
 // SPDX-License-Identifier: MIT
 
+use std::{future::Future, pin::Pin};
+
 use bytes::{Buf, BufMut};
 use failure::Fail;
 use failure::_core::convert::TryFrom;
@@ -18,6 +20,7 @@ use tezos_encoding::{
     binary_reader::{BinaryReader, BinaryReaderError},
     binary_writer::BinaryWriterError,
 };
+use tokio::io::AsyncRead;
 
 use crate::p2p::binary_message::MessageHashError::SerializationError;
 
@@ -196,6 +199,8 @@ pub trait BinaryMessage: Sized {
 
     /// Create new struct from bytes.
     fn from_bytes<B: AsRef<[u8]>>(buf: B) -> Result<Self, BinaryReaderError>;
+
+    fn async_read<'a, R: AsyncRead + Unpin>(read: &'a mut R) -> Pin<Box<dyn Future<Output = Result<Self, BinaryReaderError>> + 'a>>;
 }
 
 impl<T> BinaryMessage for T
@@ -225,6 +230,14 @@ where
             cache_writer.put(bytes);
         }
         Ok(myself)
+    }
+
+    fn async_read<'a, R: AsyncRead + Unpin>(read: &'a mut R) -> Pin<Box<dyn Future<Output = Result<Self, BinaryReaderError>> + 'a>> {
+        Box::pin(async move {
+            let value = BinaryReader::new().read_message_async(read, &Self::encoding()).await?;
+            let myself: Self = deserialize_from_value(&value)?;
+            Ok(myself)
+        })
     }
 }
 
