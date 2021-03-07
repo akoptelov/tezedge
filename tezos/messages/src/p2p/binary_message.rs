@@ -200,7 +200,9 @@ pub trait BinaryMessage: Sized {
     /// Create new struct from bytes.
     fn from_bytes<B: AsRef<[u8]>>(buf: B) -> Result<Self, BinaryReaderError>;
 
-    fn async_read<'a, R: AsyncRead + Unpin>(read: &'a mut R) -> Pin<Box<dyn Future<Output = Result<Self, BinaryReaderError>> + 'a>>;
+    fn async_read<'a, R: AsyncRead + Unpin + Send>(
+        read: &'a mut R,
+    ) -> Pin<Box<dyn Future<Output = Result<Self, BinaryReaderError>> + Send + 'a>>;
 }
 
 impl<T> BinaryMessage for T
@@ -232,10 +234,18 @@ where
         Ok(myself)
     }
 
-    fn async_read<'a, R: AsyncRead + Unpin>(read: &'a mut R) -> Pin<Box<dyn Future<Output = Result<Self, BinaryReaderError>> + 'a>> {
+    fn async_read<'a, R: AsyncRead + Unpin + Send>(
+        read: &'a mut R,
+    ) -> Pin<Box<dyn Future<Output = Result<Self, BinaryReaderError>> + Send + 'a>> {
         Box::pin(async move {
-            let value = BinaryReader::new().read_message_async(read, &Self::encoding()).await?;
-            let myself: Self = deserialize_from_value(&value)?;
+            let myself: Self = {
+                let value = {
+                    BinaryReader::new()
+                        .read_message_async(read, Self::encoding())
+                        .await?
+                };
+                deserialize_from_value(&value)?
+            };
             Ok(myself)
         })
     }

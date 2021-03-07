@@ -155,9 +155,9 @@ pub trait CustomCodec {
 
     fn decode<'a>(
         &self,
-        buf: &'a mut (dyn BinaryRead + Unpin),
+        buf: &'a mut (dyn BinaryRead + Send + Unpin),
         encoding: &Encoding,
-    ) -> Pin<Box<dyn Future<Output = Result<Value, BinaryReaderError>> + 'a>>;
+    ) -> Pin<Box<dyn Future<Output = Result<Value, BinaryReaderError>> + Send + 'a>>;
 }
 
 impl fmt::Debug for dyn CustomCodec + Send + Sync {

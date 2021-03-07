@@ -250,7 +250,7 @@ impl EncryptedMessageReader {
             read,
             crypt_data: None,
             size_buffer: [0; 2],
-            data_buffer: vec![0; u32::MAX as usize],
+            data_buffer: vec![0; u16::MAX as usize],
             state: ReadState::ReadSize { offset: 0 },
             log,
         }
@@ -263,7 +263,10 @@ impl EncryptedMessageReader {
     }
 
     pub fn set_crypt_data(&mut self, precomputed_key: PrecomputedKey, nonce_remote: Nonce) {
-        self.crypt_data = Some(CryptData { precomputed_key, nonce_remote });
+        self.crypt_data = Some(CryptData {
+            precomputed_key,
+            nonce_remote,
+        });
     }
 
     /// Consume content of inner message reader into specific message
@@ -271,7 +274,7 @@ impl EncryptedMessageReader {
     where
         M: BinaryMessage,
     {
-        let message = M::async_read(self).await.unwrap();
+        let message = M::async_read(self).await?;
         Ok(message)
     }
 
@@ -287,7 +290,8 @@ enum ReadState {
 }
 
 struct CryptData {
-    precomputed_key: PrecomputedKey, nonce_remote: Nonce
+    precomputed_key: PrecomputedKey,
+    nonce_remote: Nonce,
 }
 
 impl CryptData {
@@ -350,7 +354,8 @@ impl AsyncRead for EncryptedMessageReader {
                     me.state = if buff.remaining() == 0 {
                         if let Some(ref mut crypt_data) = me.crypt_data {
                             let nonce = crypt_data.fetch_increment_nonce();
-                            match crypt_data.precomputed_key
+                            match crypt_data
+                                .precomputed_key
                                 .decrypt(me.data_buffer.as_slice(), &nonce)
                             {
                                 Ok(message_decrypted) => {

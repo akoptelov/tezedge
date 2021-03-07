@@ -477,9 +477,9 @@ impl CustomCodec for PathCodec {
 
     fn decode<'a>(
         &self,
-        buf: &'a mut (dyn BinaryRead + Unpin),
+        buf: &'a mut (dyn BinaryRead + Unpin + Send),
         _encoding: &Encoding,
-    ) -> Pin<Box<dyn Future<Output = Result<Value, BinaryReaderError>> + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<Value, BinaryReaderError>> + Send + 'a>> {
         Box::pin(async move {
             let mut hash = [0; HashType::OperationListListHash.size()];
             enum PathNode {

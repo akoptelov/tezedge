@@ -125,7 +125,7 @@ impl From<TryFromIntError> for BinaryReaderError {
 }
 
 pub type Result<'a> =
-    Pin<Box<dyn Future<Output = std::result::Result<Value, BinaryReaderError>> + 'a>>;
+    Pin<Box<dyn Future<Output = std::result::Result<Value, BinaryReaderError>> + Send + 'a>>;
 
 pub trait BinaryRead: AsyncRead {
     fn remaining(&self) -> std::result::Result<usize, BinaryReaderError>;
@@ -215,13 +215,13 @@ impl BinaryReader {
     /// TODO
     pub async fn read_message_async<'a>(
         &'a self,
-        buf: &'a mut (dyn AsyncRead + Unpin),
+        buf: &'a mut (dyn AsyncRead + Unpin + Send),
         encoding: &'a Encoding,
     ) -> std::result::Result<Value, BinaryReaderError> {
         let value = match encoding {
             Encoding::Dynamic(encoding) => {
                 let size = buf.read_u32().await?;
-                let take: &mut (dyn BinaryRead + Unpin) = &mut buf.take(size.into());
+                let take: &mut (dyn BinaryRead + Unpin + Send) = &mut buf.take(size.into());
                 let value = self.read_async(take, encoding).await?;
                 if take.remaining()? != 0 {
                     Err(BinaryReaderErrorKind::Overflow {
@@ -240,7 +240,7 @@ impl BinaryReader {
                         actual: ActualSize::Exact(size.try_into()?),
                     })?
                 } else {
-                    let take: &mut (dyn BinaryRead + Unpin) = &mut buf.take(size.into());
+                    let take: &mut (dyn BinaryRead + Unpin + Send) = &mut buf.take(size.into());
                     let value = self.read_async(take, encoding).await?;
                     if take.remaining()? != 0 {
                         Err(BinaryReaderErrorKind::Overflow {
@@ -261,7 +261,7 @@ impl BinaryReader {
 
     pub fn read_async<'a>(
         &'a self,
-        buf: &'a mut (dyn BinaryRead + Unpin),
+        buf: &'a mut (dyn BinaryRead + Unpin + Send),
         encoding: &'a Encoding,
     ) -> Result<'a> {
         Box::pin(async move {
@@ -277,7 +277,7 @@ impl BinaryReader {
 
     fn decode_record<'a>(
         &'a self,
-        buf: &'a mut (dyn BinaryRead + Unpin),
+        buf: &'a mut (dyn BinaryRead + Unpin + Send),
         schema: &'a [Field],
     ) -> Result<'a> {
         Box::pin(async move {
@@ -298,7 +298,7 @@ impl BinaryReader {
 
     fn decode_tuple<'a>(
         &'a self,
-        buf: &'a mut (dyn BinaryRead + Unpin),
+        buf: &'a mut (dyn BinaryRead + Unpin + Send),
         encodings: &'a [Encoding],
     ) -> Result<'a> {
         Box::pin(async move {
@@ -312,7 +312,7 @@ impl BinaryReader {
 
     fn decode_value<'a>(
         &'a self,
-        buf: &'a mut (dyn BinaryRead + Unpin + 'a),
+        buf: &'a mut (dyn BinaryRead + Unpin + Send + 'a),
         encoding: &'a Encoding,
     ) -> Result<'a> {
         Box::pin(async move {
@@ -416,9 +416,10 @@ impl BinaryReader {
                         })?
                     }
                 }
-                Encoding::Bounded(max, inner_encoding) => self
-                    .decode_value(
-                        &mut buf.take(min((*max).try_into()?, buf.remaining()?.try_into()?)),
+                Encoding::Bounded(max, inner_encoding) => {
+                    let remaining = buf.remaining()?.try_into()?;
+                    self.decode_value(
+                        &mut buf.take(min((*max).try_into()?, remaining)),
                         inner_encoding,
                     )
                     .await
@@ -432,7 +433,8 @@ impl BinaryReader {
                             .into()
                         }
                         _ => e,
-                    }),
+                    })
+                }
                 Encoding::Greedy(un_sized_encoding) => {
                     self.decode_value(buf, un_sized_encoding).await
                 }

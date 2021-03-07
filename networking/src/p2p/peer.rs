@@ -426,16 +426,16 @@ pub async fn bootstrap(
     let mut msg_rx = EncryptedMessageReader::new(msg_rx, log.clone());
 
     // receive connection message
-    let received_connection_message_bytes = match timeout(IO_TIMEOUT, msg_rx.read_connection_message()).await?
-    {
-        Ok(msg) => msg,
-        Err(e) => {
-            return Err(PeerError::NetworkError {
-                error: e.into(),
-                message: "No response to connection message was received",
-            })
-        }
-    };
+    let received_connection_message_bytes =
+        match timeout(IO_TIMEOUT, msg_rx.read_connection_message()).await? {
+            Ok(msg) => msg,
+            Err(e) => {
+                return Err(PeerError::NetworkError {
+                    error: e.into(),
+                    message: "No response to connection message was received",
+                })
+            }
+        };
 
     let connection_message =
         ConnectionMessage::from_bytes(received_connection_message_bytes.content())?;
