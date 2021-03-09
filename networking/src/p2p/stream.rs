@@ -256,10 +256,30 @@ impl EncryptedMessageReader {
         }
     }
 
+    /// Read message from network and return message contents in a form of bytes.
+    /// Each message is prefixed by a 2 bytes indicating total length of the message.
     pub async fn read_connection_message(&mut self) -> Result<BinaryChunk, StreamError> {
-        let mut buf = vec![];
-        self.read_to_end(&mut buf).await?;
-        Ok(buf.try_into()?)
+        // read encoding length (2 bytes)
+        let msg_len_bytes = self.read_message_length_bytes().await?;
+        // copy bytes containing encoding length to`` raw encoding buffer
+        let mut all_recv_bytes = vec![];
+        all_recv_bytes.extend(&msg_len_bytes);
+
+        // read the message contents
+        let msg_len = (&msg_len_bytes[..]).get_u16() as usize;
+        let mut msg_content_bytes = vec![0u8; msg_len];
+        self.read.read_exact(&mut msg_content_bytes).await?;
+        all_recv_bytes.extend(&msg_content_bytes);
+
+        Ok(all_recv_bytes.try_into()?)
+    }
+
+    /// Read 2 bytes containing total length of the message contents from the network stream.
+    /// Total length is encoded as u big endian u16.
+    async fn read_message_length_bytes(&mut self) -> io::Result<[u8; CONTENT_LENGTH_FIELD_BYTES]> {
+        let mut msg_len_bytes: [u8; CONTENT_LENGTH_FIELD_BYTES] = [0; CONTENT_LENGTH_FIELD_BYTES];
+        self.read.read_exact(&mut msg_len_bytes).await?;
+        Ok(msg_len_bytes)
     }
 
     pub fn set_crypt_data(&mut self, precomputed_key: PrecomputedKey, nonce_remote: Nonce) {
