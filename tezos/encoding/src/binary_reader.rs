@@ -177,7 +177,7 @@ impl BinaryReader {
     ///
     /// let reader = BinaryReader::new();
     /// // create intermediate form
-    /// let intermediate = reader.read(hex::decode("0000000476312e3000010000").unwrap(), &version_schema).unwrap();
+    /// let intermediate = reader.from_bytes_sync(hex::decode("0000000476312e3000010000").unwrap(), &version_schema).unwrap();
     /// // deserialize from intermediate form
     /// let version = de::from_value::<Version>(&intermediate).unwrap();
     ///
@@ -185,7 +185,7 @@ impl BinaryReader {
     ///
     /// assert_eq!(version, version_expected);
     /// ```
-    pub fn read<Buf: AsRef<[u8]>>(
+    pub fn from_bytes_sync<Buf: AsRef<[u8]>>(
         &self,
         buf: Buf,
         encoding: &Encoding,
@@ -193,7 +193,34 @@ impl BinaryReader {
         let rt = tokio::runtime::Builder::new_current_thread().build()?;
         let buf = buf.as_ref();
         let mut read = Cursor::new(buf).take(buf.len().try_into()?);
-        match rt.block_on(self.read_async(&mut read, encoding)) {
+        match rt.block_on(self.decode_async(&mut read, encoding)) {
+            Ok(value) => {
+                if read.remaining()? == 0 {
+                    Ok(value)
+                } else {
+                    Err(BinaryReaderErrorKind::Overflow {
+                        bytes: read.remaining()?,
+                    })?
+                }
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Convert Tezos binary data into [intermadiate form](Value). Input binary is parsed according to [`encoding`](Encoding).
+    ///
+    /// # Examples:
+    ///
+    /// TODO
+    pub async fn from_bytes_async<Buf: AsRef<[u8]>>(
+        &self,
+        buf: Buf,
+        encoding: &Encoding,
+    ) -> std::result::Result<Value, BinaryReaderError> {
+        let rt = tokio::runtime::Builder::new_current_thread().build()?;
+        let buf = buf.as_ref();
+        let mut read = Cursor::new(buf).take(buf.len().try_into()?);
+        match rt.block_on(self.decode_async(&mut read, encoding)) {
             Ok(value) => {
                 if read.remaining()? == 0 {
                     Ok(value)
@@ -222,7 +249,7 @@ impl BinaryReader {
             Encoding::Dynamic(encoding) => {
                 let size = buf.read_u32().await?;
                 let take: &mut (dyn BinaryRead + Unpin + Send) = &mut buf.take(size.into());
-                let value = self.read_async(take, encoding).await?;
+                let value = self.decode_async(take, encoding).await?;
                 if take.remaining()? != 0 {
                     Err(BinaryReaderErrorKind::Overflow {
                         bytes: take.remaining()?,
@@ -241,7 +268,7 @@ impl BinaryReader {
                     })?
                 } else {
                     let take: &mut (dyn BinaryRead + Unpin + Send) = &mut buf.take(size.into());
-                    let value = self.read_async(take, encoding).await?;
+                    let value = self.decode_async(take, encoding).await?;
                     if take.remaining()? != 0 {
                         Err(BinaryReaderErrorKind::Overflow {
                             bytes: take.remaining()?,
@@ -259,7 +286,7 @@ impl BinaryReader {
         Ok(value)
     }
 
-    pub fn read_async<'a>(
+    fn decode_async<'a>(
         &'a self,
         buf: &'a mut (dyn BinaryRead + Unpin + Send),
         encoding: &'a Encoding,
@@ -653,7 +680,7 @@ mod tests {
         let mut record_buf = Cursor::new(hex::decode("9e9ed49d01").unwrap());
         let reader = BinaryReader::new();
         let value = reader
-            .read_async(&mut record_buf, &Encoding::Obj(record_schema))
+            .decode_async(&mut record_buf, &Encoding::Obj(record_schema))
             .await
             .unwrap();
         assert_eq!(
@@ -676,7 +703,7 @@ mod tests {
         let record_buf = hex::decode("9e9ed49d01").unwrap();
         let reader = BinaryReader::new();
         let value = reader
-            .read(record_buf, &Encoding::Obj(record_schema))
+            .from_bytes_sync(record_buf, &Encoding::Obj(record_schema))
             .unwrap();
         assert_eq!(
             Value::Record(vec![(
@@ -725,7 +752,7 @@ mod tests {
         let record_buf = hex::decode("0000000600108eceda2f").unwrap();
         let reader = BinaryReader::new();
         let value = reader
-            .read(record_buf, &Encoding::Obj(response_schema))
+            .from_bytes_sync(record_buf, &Encoding::Obj(response_schema))
             .unwrap();
         // convert value to actual data structure
         let value: Response = de::from_value(&value).unwrap();
@@ -758,7 +785,9 @@ mod tests {
             let record_bytes = binary_writer::write(&record, &record_encoding).unwrap();
 
             let reader = BinaryReader::new();
-            let value_deserialized = reader.read(record_bytes, &record_encoding).unwrap();
+            let value_deserialized = reader
+                .from_bytes_sync(record_bytes, &record_encoding)
+                .unwrap();
 
             assert_eq!(value_serialized, value_deserialized)
         }
@@ -823,7 +852,7 @@ mod tests {
         let connection_message_buf = hex::decode("0bb9eaef40186db19fd6f56ed5b1af57f9d9c8a1eed85c29f8e4daaa7367869c0f0b000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000014100010001000000014200020000").unwrap();
         let reader = BinaryReader::new();
         let value = reader
-            .read(connection_message_buf, &connection_message_encoding)
+            .from_bytes_sync(connection_message_buf, &connection_message_encoding)
             .unwrap();
 
         let connection_message_deserialized: ConnectionMessage = de::from_value(&value).unwrap();
@@ -855,7 +884,7 @@ mod tests {
                 .unwrap();
         let reader = BinaryReader::new();
         let value = reader
-            .read(message_buf, &Encoding::option(record_encoding))
+            .from_bytes_sync(message_buf, &Encoding::option(record_encoding))
             .unwrap();
 
         let record_deserialized: Option<Record> = de::from_value(&value).unwrap();
@@ -880,7 +909,7 @@ mod tests {
         let message_buf = hex::decode("00").unwrap();
         let reader = BinaryReader::new();
         let value = reader
-            .read(message_buf, &Encoding::option(record_encoding))
+            .from_bytes_sync(message_buf, &Encoding::option(record_encoding))
             .unwrap();
 
         let record_deserialized: Option<Record> = de::from_value(&value).unwrap();
@@ -892,7 +921,7 @@ mod tests {
         let schema = Encoding::Obj(vec![Field::new("xxx", Encoding::BoundedString(1))]);
         let data = hex::decode("000000020000").unwrap();
         let err = BinaryReader::new()
-            .read(data, &schema)
+            .from_bytes_sync(data, &schema)
             .expect_err("Error is expected");
         let kind = err.kind();
         assert!(matches!(
@@ -915,7 +944,7 @@ mod tests {
         )]);
         let data = hex::decode("0000").unwrap();
         let err = BinaryReader::new()
-            .read(data, &schema)
+            .from_bytes_sync(data, &schema)
             .expect_err("Error is expected");
         let kind = err.kind();
         assert!(matches!(
@@ -938,7 +967,7 @@ mod tests {
         )]);
         let data = hex::decode("000000020000").unwrap();
         let err = BinaryReader::new()
-            .read(data, &schema)
+            .from_bytes_sync(data, &schema)
             .expect_err("Error is expected");
         let kind = err.kind();
         assert!(matches!(
@@ -959,7 +988,7 @@ mod tests {
         let encoded = hex::decode("000000ff00112233445566778899AABBCCDDEEFF").unwrap(); // dynamic block states 255 bytes, got only 16
         let encoding = Encoding::bounded(1000, Encoding::dynamic(Encoding::list(Encoding::Uint8)));
         let err = BinaryReader::new()
-            .read(encoded, &encoding)
+            .from_bytes_sync(encoded, &encoding)
             .expect_err("Error is expected");
         assert!(
             matches!(err.kind(), BinaryReaderErrorKind::Underflow { .. }),

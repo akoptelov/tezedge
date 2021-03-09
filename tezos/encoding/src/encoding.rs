@@ -416,7 +416,7 @@ mod tests {
 
         let data = [1, 2];
 
-        let res = BinaryReader::new().read(data, &encoding);
+        let res = BinaryReader::new().from_bytes_sync(data, &encoding);
         assert_eq!(res.unwrap(), value);
     }
 
@@ -438,7 +438,7 @@ mod tests {
             0, 0, 0, 2, 0x42, 0x42,
         ];
 
-        let res = BinaryReader::new().read(data, &encoding);
+        let res = BinaryReader::new().from_bytes_sync(data, &encoding);
         assert_eq!(res.unwrap(), value);
     }
 }

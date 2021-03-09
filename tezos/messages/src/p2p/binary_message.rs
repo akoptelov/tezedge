@@ -200,6 +200,11 @@ pub trait BinaryMessage: Sized {
     /// Create new struct from bytes.
     fn from_bytes<B: AsRef<[u8]>>(buf: B) -> Result<Self, BinaryReaderError>;
 
+    /// Create new struct from bytes.
+    fn from_bytes_async<'a, B: AsRef<[u8]> + Send + 'a>(
+        buf: B,
+    ) -> Pin<Box<dyn Future<Output = Result<Self, BinaryReaderError>> + Send + 'a>>;
+
     fn async_read<'a, R: AsyncRead + Unpin + Send>(
         read: &'a mut R,
     ) -> Pin<Box<dyn Future<Output = Result<Self, BinaryReaderError>> + Send + 'a>>;
@@ -226,12 +231,29 @@ where
     fn from_bytes<B: AsRef<[u8]>>(bytes: B) -> Result<Self, BinaryReaderError> {
         let bytes = bytes.as_ref();
 
-        let value = BinaryReader::new().read(bytes, &Self::encoding())?;
+        let value = BinaryReader::new().from_bytes_sync(bytes, &Self::encoding())?;
         let mut myself: Self = deserialize_from_value(&value)?;
         if let Some(cache_writer) = myself.cache_writer() {
             cache_writer.put(bytes);
         }
         Ok(myself)
+    }
+
+    fn from_bytes_async<'a, B: AsRef<[u8]> + Send + 'a>(
+        bytes: B,
+    ) -> Pin<Box<dyn Future<Output = Result<Self, BinaryReaderError>> + Send + 'a>> {
+        Box::pin(async move {
+            let bytes = bytes.as_ref();
+
+            let value = BinaryReader::new()
+                .from_bytes_async(bytes, &Self::encoding())
+                .await?;
+            let mut myself: Self = deserialize_from_value(&value)?;
+            if let Some(cache_writer) = myself.cache_writer() {
+                cache_writer.put(bytes);
+            }
+            Ok(myself)
+        })
     }
 
     fn async_read<'a, R: AsyncRead + Unpin + Send>(

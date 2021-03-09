@@ -16,7 +16,7 @@ fn main() {
         for _ in 0..ENCODING_LIFETIME {
             let encoding = generate_random_encoding();
             fuzz!(|data: &[u8]| {
-                if let Err(e) = BinaryReader::new().read(data, &encoding) {
+                if let Err(e) = BinaryReader::new().from_bytes_sync(data, &encoding) {
                     debug!(
                         "BinaryReader produced error for input: {:?}\nError:\n{:?}",
                         data, e

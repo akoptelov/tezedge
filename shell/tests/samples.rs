@@ -44,7 +44,7 @@ lazy_static! {
 #[inline]
 pub fn from_captured_bytes(request: &str) -> Result<ApplyBlockRequest, failure::Error> {
     let bytes = hex::decode(request)?;
-    let value = BinaryReader::new().read(bytes, &APPLY_BLOCK_REQUEST_ENCODING)?;
+    let value = BinaryReader::new().from_bytes_sync(bytes, &APPLY_BLOCK_REQUEST_ENCODING)?;
     let value: ApplyBlockRequest = deserialize_from_value(&value)?;
     Ok(value)
 }

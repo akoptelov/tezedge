@@ -438,7 +438,7 @@ pub async fn bootstrap(
         };
 
     let connection_message =
-        ConnectionMessage::from_bytes(received_connection_message_bytes.content())?;
+        ConnectionMessage::from_bytes_async(received_connection_message_bytes.content()).await?;
 
     // generate local and remote nonce
     let NoncePair {
