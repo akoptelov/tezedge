@@ -83,12 +83,12 @@ pub fn deserialize_benchmark(c: &mut Criterion) {
     c.bench_function("from_bytes_reader", |b| {
         b.iter(|| {
             BinaryReader::new()
-                .from_bytes_sync(black_box(message_bytes.clone()), &Operation::encoding())
+                .read(black_box(message_bytes.clone()), &Operation::encoding())
                 .unwrap()
         })
     });
     let value = BinaryReader::new()
-        .from_bytes_sync(black_box(message_bytes.clone()), &Operation::encoding())
+        .read(black_box(message_bytes.clone()), &Operation::encoding())
         .unwrap();
     c.bench_function("from_bytes_deserialize", |b| {
         b.iter(|| deserialize_from_value::<Operation>(black_box(&value)).unwrap())
@@ -297,7 +297,7 @@ pub fn decode_value_hash_benchmark(c: &mut Criterion) {
     .as_ref();
     let br = BinaryReader::new();
     c.bench_function("decode_value_hash", |b| {
-        b.iter(|| br.from_bytes_sync(&mut buf, &Encoding::Hash(HashType::PublicKeyEd25519)))
+        b.iter(|| br.read(&mut buf, &Encoding::Hash(HashType::PublicKeyEd25519)))
     });
 }
 
@@ -310,7 +310,7 @@ pub fn decode_value_bytes_benchmark(c: &mut Criterion) {
     .as_ref();
     let br = BinaryReader::new();
     c.bench_function("decode_value_bytes", |b| {
-        b.iter(|| br.from_bytes_sync(&mut buf, &Encoding::Bytes))
+        b.iter(|| br.read(&mut buf, &Encoding::Bytes))
     });
 }
 

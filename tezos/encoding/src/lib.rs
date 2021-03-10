@@ -8,6 +8,7 @@
 mod bit_utils;
 pub mod types;
 
+pub mod binary_async_reader;
 pub mod binary_reader;
 pub mod binary_writer;
 pub mod de;

@@ -11,11 +11,14 @@ use serde::Serialize;
 
 use crypto::blake2b::{self, Blake2bError};
 use crypto::hash::Hash;
-use tezos_encoding::de::from_value as deserialize_from_value;
+use tezos_encoding::binary_writer;
 use tezos_encoding::encoding::HasEncoding;
 use tezos_encoding::json_writer::JsonWriter;
 use tezos_encoding::ser;
-use tezos_encoding::{binary_reader::BinaryRead, binary_writer};
+use tezos_encoding::{
+    binary_async_reader::{BinaryAsyncReader, BinaryRead},
+    de::from_value as deserialize_from_value,
+};
 use tezos_encoding::{
     binary_reader::{BinaryReader, BinaryReaderError},
     binary_writer::BinaryWriterError,
@@ -200,11 +203,6 @@ pub trait BinaryMessage: Sized {
     /// Create new struct from bytes.
     fn from_bytes<B: AsRef<[u8]>>(buf: B) -> Result<Self, BinaryReaderError>;
 
-    /// Create new struct from bytes.
-    fn from_bytes_async<'a, B: AsRef<[u8]> + Send + 'a>(
-        buf: B,
-    ) -> Pin<Box<dyn Future<Output = Result<Self, BinaryReaderError>> + Send + 'a>>;
-
     /// Reads a new struct from the limited stream of bytes
     fn read<'a, R: BinaryRead + Unpin + Send>(
         read: &'a mut R,
@@ -237,29 +235,12 @@ where
     fn from_bytes<B: AsRef<[u8]>>(bytes: B) -> Result<Self, BinaryReaderError> {
         let bytes = bytes.as_ref();
 
-        let value = BinaryReader::new().from_bytes_sync(bytes, &Self::encoding())?;
+        let value = BinaryReader::new().read(bytes, &Self::encoding())?;
         let mut myself: Self = deserialize_from_value(&value)?;
         if let Some(cache_writer) = myself.cache_writer() {
             cache_writer.put(bytes);
         }
         Ok(myself)
-    }
-
-    fn from_bytes_async<'a, B: AsRef<[u8]> + Send + 'a>(
-        bytes: B,
-    ) -> Pin<Box<dyn Future<Output = Result<Self, BinaryReaderError>> + Send + 'a>> {
-        Box::pin(async move {
-            let bytes = bytes.as_ref();
-
-            let value = BinaryReader::new()
-                .from_bytes_async(bytes, &Self::encoding())
-                .await?;
-            let mut myself: Self = deserialize_from_value(&value)?;
-            if let Some(cache_writer) = myself.cache_writer() {
-                cache_writer.put(bytes);
-            }
-            Ok(myself)
-        })
     }
 
     fn read<'a, R: BinaryRead + Unpin + Send>(
@@ -268,7 +249,7 @@ where
         Box::pin(async move {
             let myself: Self = {
                 let value = {
-                    BinaryReader::new()
+                    BinaryAsyncReader::new()
                         .read_message(read, Self::encoding())
                         .await?
                 };
@@ -284,7 +265,7 @@ where
         Box::pin(async move {
             let myself: Self = {
                 let value = {
-                    BinaryReader::new()
+                    BinaryAsyncReader::new()
                         .read_dynamic_message(read, Self::encoding())
                         .await?
                 };

@@ -7,9 +7,11 @@ use std::fmt;
 use std::sync::Arc;
 use std::{collections::HashMap, future::Future, pin::Pin};
 
+use bytes::Buf;
 use crypto::hash::HashType;
 
-use crate::binary_reader::{BinaryRead, BinaryReaderError};
+use crate::binary_async_reader::BinaryRead;
+use crate::binary_reader::BinaryReaderError;
 use crate::ser::Error;
 use crate::types::Value;
 
@@ -153,7 +155,9 @@ pub trait CustomCodec {
         encoding: &Encoding,
     ) -> Result<(), Error>;
 
-    fn decode<'a>(
+    fn decode(&self, buf: &mut dyn Buf, encoding: &Encoding) -> Result<Value, BinaryReaderError>;
+
+    fn decode_async<'a>(
         &self,
         buf: &'a mut (dyn BinaryRead + Send + Unpin),
         encoding: &Encoding,
@@ -416,7 +420,7 @@ mod tests {
 
         let data = [1, 2];
 
-        let res = BinaryReader::new().from_bytes_sync(data, &encoding);
+        let res = BinaryReader::new().read(data, &encoding);
         assert_eq!(res.unwrap(), value);
     }
 
@@ -438,7 +442,7 @@ mod tests {
             0, 0, 0, 2, 0x42, 0x42,
         ];
 
-        let res = BinaryReader::new().from_bytes_sync(data, &encoding);
+        let res = BinaryReader::new().read(data, &encoding);
         assert_eq!(res.unwrap(), value);
     }
 }

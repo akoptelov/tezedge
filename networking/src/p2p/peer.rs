@@ -11,10 +11,9 @@ use failure::{Error, Fail};
 use futures::lock::Mutex;
 use riker::actors::*;
 use slog::{debug, info, o, trace, warn, Logger};
-use tokio::io::AsyncWriteExt;
-use tokio::net::TcpStream;
 use tokio::runtime::Handle;
 use tokio::time::timeout;
+use tokio::{io::AsyncWriteExt, net::TcpStream};
 
 use crypto::nonce::{self, Nonce, NoncePair};
 use crypto::{
@@ -438,7 +437,7 @@ pub async fn bootstrap(
         };
 
     let connection_message =
-        ConnectionMessage::from_bytes_async(received_connection_message_bytes.content()).await?;
+        ConnectionMessage::from_bytes(received_connection_message_bytes.content())?;
 
     // generate local and remote nonce
     let NoncePair {

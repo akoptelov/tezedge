@@ -18,7 +18,8 @@ use crypto::crypto_box::PrecomputedKey;
 use crypto::nonce::Nonce;
 use crypto::CryptoError;
 use tezos_encoding::{
-    binary_reader::{BinaryRead, BinaryReaderError, BinaryReaderErrorKind},
+    binary_async_reader::BinaryRead,
+    binary_reader::{BinaryReaderError, BinaryReaderErrorKind},
     binary_writer::BinaryWriterError,
 };
 use tezos_messages::p2p::binary_message::{
