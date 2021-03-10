@@ -386,14 +386,14 @@ impl AsyncRead for EncryptedMessageReader {
                         Poll::Ready(res) => res?,
                         Poll::Pending => return Poll::Pending,
                     }
-                    if rem == rbuff.remaining() {
+                    let rem_new = rbuff.remaining();
+                    if rem == rem_new {
                         return Err(io::Error::new(
                             io::ErrorKind::UnexpectedEof,
                             "eof reading chunk size",
                         ))
                         .into();
                     }
-                    let rem_new = rbuff.remaining();
                     me.state = if rem_new == 0 {
                         let size: usize = u16::from_be_bytes(buff) as usize;
                         debug!(me.log, "Chunk size is ready"; "size" => size);
@@ -406,7 +406,7 @@ impl AsyncRead for EncryptedMessageReader {
                         ReadState::ReadSize {
                             mode,
                             buff,
-                            offset: offset + rem_new - rem,
+                            offset: offset + rem - rem_new,
                         }
                     };
                 }
@@ -421,14 +421,14 @@ impl AsyncRead for EncryptedMessageReader {
                         Poll::Ready(res) => res?,
                         Poll::Pending => return Poll::Pending,
                     }
-                    if rem == rbuff.remaining() {
+                    let rem_new = rbuff.remaining();
+                    if rem == rem_new {
                         return Err(io::Error::new(
                             io::ErrorKind::UnexpectedEof,
                             "eof reading chunk data",
                         ))
                         .into();
                     }
-                    let rem_new = rbuff.remaining();
                     me.state = if rem_new == 0 {
                         if let Some(ref mut crypt_data) = me.crypt_data {
                             debug!(me.log, "Encrypted chunk is ready"; "size" => buff.len());
@@ -462,7 +462,7 @@ impl AsyncRead for EncryptedMessageReader {
                         ReadState::ReadData {
                             mode,
                             buff: std::mem::replace(buff, vec![]),
-                            offset: offset + rem_new - rem,
+                            offset: offset + rem - rem_new,
                         }
                     };
                 }
