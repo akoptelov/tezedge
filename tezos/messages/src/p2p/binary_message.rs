@@ -11,11 +11,11 @@ use serde::Serialize;
 
 use crypto::blake2b::{self, Blake2bError};
 use crypto::hash::Hash;
-use tezos_encoding::binary_writer;
 use tezos_encoding::de::from_value as deserialize_from_value;
 use tezos_encoding::encoding::HasEncoding;
 use tezos_encoding::json_writer::JsonWriter;
 use tezos_encoding::ser;
+use tezos_encoding::{binary_reader::BinaryRead, binary_writer};
 use tezos_encoding::{
     binary_reader::{BinaryReader, BinaryReaderError},
     binary_writer::BinaryWriterError,
@@ -205,7 +205,13 @@ pub trait BinaryMessage: Sized {
         buf: B,
     ) -> Pin<Box<dyn Future<Output = Result<Self, BinaryReaderError>> + Send + 'a>>;
 
-    fn async_read<'a, R: AsyncRead + Unpin + Send>(
+    /// Reads a new struct from the limited stream of bytes
+    fn read<'a, R: BinaryRead + Unpin + Send>(
+        read: &'a mut R,
+    ) -> Pin<Box<dyn Future<Output = Result<Self, BinaryReaderError>> + Send + 'a>>;
+
+    /// Reads a new struct with dynamic encoding from the stream of bytes.
+    fn read_dynamic<'a, R: AsyncRead + Unpin + Send>(
         read: &'a mut R,
     ) -> Pin<Box<dyn Future<Output = Result<Self, BinaryReaderError>> + Send + 'a>>;
 }
@@ -256,14 +262,30 @@ where
         })
     }
 
-    fn async_read<'a, R: AsyncRead + Unpin + Send>(
+    fn read<'a, R: BinaryRead + Unpin + Send>(
         read: &'a mut R,
     ) -> Pin<Box<dyn Future<Output = Result<Self, BinaryReaderError>> + Send + 'a>> {
         Box::pin(async move {
             let myself: Self = {
                 let value = {
                     BinaryReader::new()
-                        .read_message_async(read, Self::encoding())
+                        .read_message(read, Self::encoding())
+                        .await?
+                };
+                deserialize_from_value(&value)?
+            };
+            Ok(myself)
+        })
+    }
+
+    fn read_dynamic<'a, R: AsyncRead + Unpin + Send>(
+        read: &'a mut R,
+    ) -> Pin<Box<dyn Future<Output = Result<Self, BinaryReaderError>> + Send + 'a>> {
+        Box::pin(async move {
+            let myself: Self = {
+                let value = {
+                    BinaryReader::new()
+                        .read_dynamic_message(read, Self::encoding())
                         .await?
                 };
                 deserialize_from_value(&value)?

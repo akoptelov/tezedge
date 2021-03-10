@@ -10,14 +10,17 @@ use std::{convert::TryInto, io, pin::Pin, task::Poll};
 use bytes::Buf;
 use failure::_core::time::Duration;
 use failure::{Error, Fail};
-use slog::{trace, FnValue, Logger};
+use slog::{debug, trace, FnValue, Logger};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadBuf, ReadHalf, WriteHalf};
 use tokio::net::TcpStream;
 
 use crypto::crypto_box::PrecomputedKey;
 use crypto::nonce::Nonce;
 use crypto::CryptoError;
-use tezos_encoding::{binary_reader::BinaryReaderError, binary_writer::BinaryWriterError};
+use tezos_encoding::{
+    binary_reader::{BinaryRead, BinaryReaderError, BinaryReaderErrorKind},
+    binary_writer::BinaryWriterError,
+};
 use tezos_messages::p2p::binary_message::{
     BinaryChunk, BinaryChunkError, BinaryMessage, CONTENT_LENGTH_FIELD_BYTES,
 };
@@ -233,10 +236,6 @@ pub struct EncryptedMessageReader {
     crypt_data: Option<CryptData>,
     /// Incoming message reader
     read: ReadHalf<TcpStream>,
-    /// Chunk size buffer
-    size_buffer: [u8; 2],
-    /// Chunk data buffer
-    data_buffer: Vec<u8>,
     /// Async read state
     state: ReadState,
     /// Logger
@@ -249,9 +248,11 @@ impl EncryptedMessageReader {
         EncryptedMessageReader {
             read,
             crypt_data: None,
-            size_buffer: [0; 2],
-            data_buffer: vec![0; u16::MAX as usize],
-            state: ReadState::ReadSize { offset: 0 },
+            state: ReadState::ReadSize {
+                mode: ReadMode::Continious,
+                buff: [0; 2],
+                offset: 0,
+            },
             log,
         }
     }
@@ -290,11 +291,30 @@ impl EncryptedMessageReader {
     }
 
     /// Consume content of inner message reader into specific message
+    pub async fn read_dynamic_message<M>(&mut self) -> Result<M, StreamError>
+    where
+        M: BinaryMessage,
+    {
+        self.state = ReadState::ReadSize {
+            mode: ReadMode::Continious,
+            buff: [0; 2],
+            offset: 0,
+        };
+        let message = M::read_dynamic(self).await?;
+        Ok(message)
+    }
+
+    /// Consume content of a single chunk and decode it into a message of specified type
     pub async fn read_message<M>(&mut self) -> Result<M, StreamError>
     where
         M: BinaryMessage,
     {
-        let message = M::async_read(self).await?;
+        self.state = ReadState::ReadSize {
+            mode: ReadMode::Chunked,
+            buff: [0; 2],
+            offset: 0,
+        };
+        let message = M::read(self).await?;
         Ok(message)
     }
 
@@ -303,10 +323,32 @@ impl EncryptedMessageReader {
     }
 }
 
+/// Chunk reading mode
+#[derive(Debug, Clone, Copy)]
+enum ReadMode {
+    /// Message is limited by the size of the chunk
+    Chunked,
+    /// Message may consist of several chunks
+    Continious,
+}
+
+#[derive(Debug, Clone)]
 enum ReadState {
-    ReadSize { offset: usize },
-    ReadData { size: usize, offset: usize },
-    DataAvail { size: usize, offset: usize },
+    ReadSize {
+        mode: ReadMode,
+        buff: [u8; 2],
+        offset: usize,
+    },
+    ReadData {
+        mode: ReadMode,
+        buff: Vec<u8>,
+        offset: usize,
+    },
+    DataAvail {
+        mode: ReadMode,
+        buff: Vec<u8>,
+        offset: usize,
+    },
 }
 
 struct CryptData {
@@ -332,56 +374,72 @@ impl AsyncRead for EncryptedMessageReader {
         let me = &mut *self;
         loop {
             match me.state {
-                ReadState::ReadSize { offset } => {
-                    let mut buff = ReadBuf::new(&mut me.size_buffer[offset..]);
-                    let rem = buff.remaining();
-                    match Pin::new(&mut me.read).poll_read(cx, &mut buff) {
-                        Poll::Ready(_) => (),
+                ReadState::ReadSize {
+                    mode,
+                    mut buff,
+                    offset,
+                } => {
+                    let mut rbuff = ReadBuf::new(&mut buff[offset..]);
+                    let rem = rbuff.remaining();
+                    match Pin::new(&mut me.read).poll_read(cx, &mut rbuff) {
+                        Poll::Ready(res) => res?,
                         Poll::Pending => return Poll::Pending,
                     }
-                    if rem == buff.remaining() {
+                    if rem == rbuff.remaining() {
                         return Err(io::Error::new(
                             io::ErrorKind::UnexpectedEof,
                             "eof reading chunk size",
                         ))
                         .into();
                     }
-                    me.state = if buff.remaining() == 0 {
+                    let rem_new = rbuff.remaining();
+                    me.state = if rem_new == 0 {
+                        let size: usize = u16::from_be_bytes(buff) as usize;
+                        debug!(me.log, "Chunk size is ready"; "size" => size);
                         ReadState::ReadData {
-                            size: u16::from_be_bytes(me.size_buffer) as usize,
+                            mode,
+                            buff: vec![0; size],
                             offset: 0,
                         }
                     } else {
                         ReadState::ReadSize {
-                            offset: offset + buff.remaining() - rem,
+                            mode,
+                            buff,
+                            offset: offset + rem_new - rem,
                         }
                     };
                 }
-                ReadState::ReadData { size, offset } => {
-                    let mut buff = ReadBuf::new(&mut me.data_buffer.as_mut_slice()[offset..size]);
-                    let rem = buff.remaining();
-                    match Pin::new(&mut me.read).poll_read(cx, &mut buff) {
-                        Poll::Ready(_) => (),
+                ReadState::ReadData {
+                    mode,
+                    ref mut buff,
+                    offset,
+                } => {
+                    let mut rbuff = ReadBuf::new(&mut buff.as_mut_slice()[offset..]);
+                    let rem = rbuff.remaining();
+                    match Pin::new(&mut me.read).poll_read(cx, &mut rbuff) {
+                        Poll::Ready(res) => res?,
                         Poll::Pending => return Poll::Pending,
                     }
-                    if rem == buff.remaining() {
+                    if rem == rbuff.remaining() {
                         return Err(io::Error::new(
                             io::ErrorKind::UnexpectedEof,
                             "eof reading chunk data",
                         ))
                         .into();
                     }
-                    me.state = if buff.remaining() == 0 {
+                    let rem_new = rbuff.remaining();
+                    me.state = if rem_new == 0 {
                         if let Some(ref mut crypt_data) = me.crypt_data {
+                            debug!(me.log, "Encrypted chunk is ready"; "size" => buff.len());
                             let nonce = crypt_data.fetch_increment_nonce();
-                            match crypt_data
-                                .precomputed_key
-                                .decrypt(me.data_buffer.as_slice(), &nonce)
-                            {
+                            match crypt_data.precomputed_key.decrypt(buff.as_slice(), &nonce) {
                                 Ok(message_decrypted) => {
                                     trace!(me.log, "Message received"; "message" => FnValue(|_| hex::encode(&message_decrypted)));
-                                    me.data_buffer.copy_from_slice(&message_decrypted);
-                                    ReadState::DataAvail { size, offset: 0 }
+                                    ReadState::DataAvail {
+                                        mode,
+                                        buff: message_decrypted,
+                                        offset: 0,
+                                    }
                                 }
                                 Err(error) => {
                                     return Err(io::Error::new(
@@ -392,33 +450,90 @@ impl AsyncRead for EncryptedMessageReader {
                                 }
                             }
                         } else {
-                            ReadState::DataAvail { size, offset: 0 }
+                            debug!(me.log, "Non-encrypted chunk is ready"; "size" => buff.len());
+                            ReadState::DataAvail {
+                                mode,
+                                buff: std::mem::replace(buff, vec![]),
+                                offset: 0,
+                            }
                         }
                     } else {
                         ReadState::ReadData {
-                            size,
-                            offset: offset + buff.remaining() - rem,
+                            mode,
+                            buff: std::mem::replace(buff, vec![]),
+                            offset: offset + rem_new - rem,
                         }
                     };
                 }
-                ReadState::DataAvail { size, offset } => {
-                    let amt = std::cmp::min(size - offset, buf.remaining());
-                    let (a, _) = me.data_buffer.as_slice().split_at(amt);
-                    buf.put_slice(a);
-                    me.state = if amt < size - offset {
-                        ReadState::DataAvail {
-                            size,
-                            offset: offset + amt,
-                        }
-                    } else if me.crypt_data.is_some() {
-                        // we should continue to the next chunk
-                        ReadState::ReadSize { offset: 0 }
+                // requested more data then available in the chunk in chunked mode
+                ReadState::DataAvail {
+                    mode,
+                    ref mut buff,
+                    offset,
+                } if buff.len() - offset < buf.remaining() => {
+                    if let ReadMode::Chunked = mode {
+                        return Err(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            "end of chunk reading one-chunk message",
+                        ))
+                        .into();
                     } else {
-                        ReadState::DataAvail { size, offset: size }
+                        // we should continue to the next chunk
+                        debug!(me.log, "Next chunk is needed");
+                        me.state = ReadState::ReadSize {
+                            mode,
+                            buff: [0; 2],
+                            offset: 0,
+                        }
+                    }
+                }
+                ReadState::DataAvail {
+                    mode,
+                    ref mut buff,
+                    offset,
+                } => {
+                    let amt = std::cmp::min(buff.len() - offset, buf.remaining());
+                    trace!(me.log, "Data requested"; "requested size" => buf.remaining(), "available bytes" => buff.len() - offset);
+                    let (a, _) = buff.as_slice()[offset..].split_at(amt);
+                    buf.put_slice(a);
+                    trace!(me.log, "Data provided"; "data" => FnValue(|_| hex::encode(a)));
+                    me.state = ReadState::DataAvail {
+                        mode,
+                        buff: std::mem::replace(buff, vec![]),
+                        offset: offset + amt,
                     };
-                    return Poll::Ready(Ok(()));
+                    if buf.remaining() == 0 {
+                        trace!(me.log, "Data is ready");
+                        return Poll::Ready(Ok(()));
+                    }
                 }
             }
+        }
+    }
+}
+
+impl BinaryRead for EncryptedMessageReader {
+    fn remaining(&self) -> Result<usize, BinaryReaderError> {
+        match self.state {
+            ReadState::ReadSize { .. }
+            | ReadState::ReadData {
+                mode: ReadMode::Continious,
+                ..
+            }
+            | ReadState::DataAvail {
+                mode: ReadMode::Continious,
+                ..
+            } => Err(BinaryReaderErrorKind::RemainingUnknown)?,
+            ReadState::ReadData {
+                mode: _,
+                ref buff,
+                offset,
+            }
+            | ReadState::DataAvail {
+                mode: _,
+                ref buff,
+                offset,
+            } => Ok(buff.len() - offset),
         }
     }
 }

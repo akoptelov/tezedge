@@ -86,6 +86,9 @@ pub enum BinaryReaderErrorKind {
     /// Int conversion error
     #[fail(display = "Error while converting integer value: {:?}", _0)]
     FromIntError(TryFromIntError),
+    /// Request for remaining bytes for non-compatible read
+    #[fail(display = "Remaining bytes unknown")]
+    RemainingUnknown,
 }
 
 impl From<std::io::Error> for BinaryReaderError {
@@ -154,6 +157,8 @@ impl BinaryReader {
 
     /// Convert Tezos binary data into [intermadiate form](Value). Input binary is parsed according to [`encoding`](Encoding).
     ///
+    /// This is a syncronous wrapper around async execution. It should not be used in asyncronous context as a new runtime is created.
+    ///
     /// # Examples:
     ///
     /// ```
@@ -193,7 +198,8 @@ impl BinaryReader {
         let rt = tokio::runtime::Builder::new_current_thread().build()?;
         let buf = buf.as_ref();
         let mut read = Cursor::new(buf).take(buf.len().try_into()?);
-        match rt.block_on(self.decode_async(&mut read, encoding)) {
+
+        match rt.block_on(self.read_message(&mut read, encoding)) {
             Ok(value) => {
                 if read.remaining()? == 0 {
                     Ok(value)
@@ -217,10 +223,9 @@ impl BinaryReader {
         buf: Buf,
         encoding: &Encoding,
     ) -> std::result::Result<Value, BinaryReaderError> {
-        let rt = tokio::runtime::Builder::new_current_thread().build()?;
         let buf = buf.as_ref();
         let mut read = Cursor::new(buf).take(buf.len().try_into()?);
-        match rt.block_on(self.decode_async(&mut read, encoding)) {
+        match self.read_message(&mut read, encoding).await {
             Ok(value) => {
                 if read.remaining()? == 0 {
                     Ok(value)
@@ -240,7 +245,7 @@ impl BinaryReader {
     ///
     /// # Examples:
     /// TODO
-    pub async fn read_message_async<'a>(
+    pub async fn read_dynamic_message<'a>(
         &'a self,
         buf: &'a mut (dyn AsyncRead + Unpin + Send),
         encoding: &'a Encoding,
@@ -249,7 +254,7 @@ impl BinaryReader {
             Encoding::Dynamic(encoding) => {
                 let size = buf.read_u32().await?;
                 let take: &mut (dyn BinaryRead + Unpin + Send) = &mut buf.take(size.into());
-                let value = self.decode_async(take, encoding).await?;
+                let value = self.read_message(take, encoding).await?;
                 if take.remaining()? != 0 {
                     Err(BinaryReaderErrorKind::Overflow {
                         bytes: take.remaining()?,
@@ -268,7 +273,7 @@ impl BinaryReader {
                     })?
                 } else {
                     let take: &mut (dyn BinaryRead + Unpin + Send) = &mut buf.take(size.into());
-                    let value = self.decode_async(take, encoding).await?;
+                    let value = self.read_message(take, encoding).await?;
                     if take.remaining()? != 0 {
                         Err(BinaryReaderErrorKind::Overflow {
                             bytes: take.remaining()?,
@@ -286,20 +291,18 @@ impl BinaryReader {
         Ok(value)
     }
 
-    fn decode_async<'a>(
+    pub async fn read_message<'a>(
         &'a self,
         buf: &'a mut (dyn BinaryRead + Unpin + Send),
         encoding: &'a Encoding,
-    ) -> Result<'a> {
-        Box::pin(async move {
-            let result = match encoding {
-                Encoding::Obj(schema) => self.decode_record(buf, schema).await?,
-                Encoding::Tup(encodings) => self.decode_tuple(buf, encodings).await?,
-                _ => self.decode_value(buf, encoding).await?,
-            };
+    ) -> std::result::Result<Value, BinaryReaderError> {
+        let result = match encoding {
+            Encoding::Obj(schema) => self.decode_record(buf, schema).await?,
+            Encoding::Tup(encodings) => self.decode_tuple(buf, encodings).await?,
+            _ => self.decode_value(buf, encoding).await?,
+        };
 
-            Ok(result)
-        })
+        Ok(result)
     }
 
     fn decode_record<'a>(
@@ -680,7 +683,7 @@ mod tests {
         let mut record_buf = Cursor::new(hex::decode("9e9ed49d01").unwrap());
         let reader = BinaryReader::new();
         let value = reader
-            .decode_async(&mut record_buf, &Encoding::Obj(record_schema))
+            .read_message(&mut record_buf, &Encoding::Obj(record_schema))
             .await
             .unwrap();
         assert_eq!(

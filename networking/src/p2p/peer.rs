@@ -574,7 +574,12 @@ async fn begin_process_incoming(
         .take()
         .expect("Someone took ownership of the encrypted reader before the Peer");
     while net.rx_run.load(Ordering::Acquire) {
-        match timeout(READ_TIMEOUT_LONG, rx.read_message::<PeerMessageResponse>()).await {
+        match timeout(
+            READ_TIMEOUT_LONG,
+            rx.read_dynamic_message::<PeerMessageResponse>(),
+        )
+        .await
+        {
             Ok(res) => match res {
                 Ok(msg) => {
                     let should_broadcast_message = net.rx_run.load(Ordering::Acquire);
